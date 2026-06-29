@@ -19,7 +19,17 @@ sys.path.append("..")
 from datasets import cmnist, get_attr_max_min, mimic, morphomnist, ukbb
 from hps import Hparams
 from train_setup import setup_directories, setup_logging, setup_tensorboard
-from utils import EMA, seed_all, seed_worker, select_device
+from utils import (
+    EMA,
+    ensure_parent_dir,
+    open_file,
+    path_exists,
+    seed_all,
+    seed_worker,
+    select_device,
+    sync_file,
+    sync_tree,
+)
 
 
 def preprocess(
@@ -341,6 +351,12 @@ if __name__ == "__main__":
         "--data_dir", help="Data directory to load form.", type=str, default=""
     )
     parser.add_argument(
+        "--ckpt_dir",
+        help="Directory to store checkpoints.",
+        type=str,
+        default="gs://causal-gen/checkpoints",
+    )
+    parser.add_argument(
         "--load_path", help="Path to load checkpoint.", type=str, default=""
     )
     parser.add_argument(
@@ -410,9 +426,10 @@ if __name__ == "__main__":
 
     # update hparams if loading checkpoint
     if args.load_path:
-        if os.path.isfile(args.load_path):
+        if path_exists(args.load_path):
             print(f"\nLoading checkpoint: {args.load_path}")
-            ckpt = torch.load(args.load_path, map_location="cpu")
+            with open_file(args.load_path, "rb") as f:
+                ckpt = torch.load(f, map_location="cpu")
             ckpt_args = {
                 k: v
                 for k, v in ckpt["hparams"].items()
@@ -456,7 +473,7 @@ if __name__ == "__main__":
 
     if not args.testing:
         # Train model
-        args.save_dir = setup_directories(args, ckpt_dir="../../checkpoints")
+        args.save_dir = setup_directories(args, ckpt_dir=args.ckpt_dir)
         writer = setup_tensorboard(args, model)
         logger = setup_logging(args)
 
@@ -559,19 +576,25 @@ if __name__ == "__main__":
             if valid_stats["loss"] < args.best_loss:
                 args.best_loss = valid_stats["loss"]
                 ckpt_path = os.path.join(args.save_dir, "checkpoint.pt")
-                torch.save(
-                    {
-                        "epoch": epoch + 1,
-                        "step": steps,
-                        "best_loss": args.best_loss,
-                        "model_state_dict": model.state_dict(),
-                        "ema_model_state_dict": ema.ema_model.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "hparams": vars(args),
-                    },
-                    ckpt_path,
-                )
+                ensure_parent_dir(ckpt_path)
+                with open_file(ckpt_path, "wb") as f:
+                    torch.save(
+                        {
+                            "epoch": epoch + 1,
+                            "step": steps,
+                            "best_loss": args.best_loss,
+                            "model_state_dict": model.state_dict(),
+                            "ema_model_state_dict": ema.ema_model.state_dict(),
+                            "optimizer_state_dict": optimizer.state_dict(),
+                            "hparams": vars(args),
+                        },
+                        f,
+                    )
+                sync_file(ckpt_path, os.path.join(args.remote_save_dir, "checkpoint.pt"))
                 logger.info(f"Model saved: {ckpt_path}")
+            if hasattr(args, "remote_save_dir"):
+                writer.flush()
+                sync_tree(args.save_dir, args.remote_save_dir)
 
     else:
         # test model

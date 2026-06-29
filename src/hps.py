@@ -23,6 +23,7 @@ morphomnist.parents_x = ["thickness", "intensity", "digit"]
 morphomnist.concat_pa = True
 morphomnist.context_norm = "[-1,1]"
 morphomnist.context_dim = 12
+morphomnist.data_dir = "gs://causal-gen/datasets/morphomnist"
 HPARAMS_REGISTRY["morphomnist"] = morphomnist
 
 
@@ -102,6 +103,12 @@ def add_arguments(parser: argparse.ArgumentParser):
     parser.add_argument("--exp_name", help="Experiment name.", type=str, default="")
     parser.add_argument(
         "--data_dir", help="Data directory to load form.", type=str, default=""
+    )
+    parser.add_argument(
+        "--ckpt_dir",
+        help="Directory to store checkpoints.",
+        type=str,
+        default="gs://causal-gen/checkpoints",
     )
     parser.add_argument("--hps", help="hyperparam set.", type=str, default="ukbb64")
     parser.add_argument(

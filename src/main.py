@@ -1,5 +1,6 @@
 import argparse
 import gc
+import logging
 import os
 import traceback
 
@@ -16,7 +17,7 @@ from train_setup import (
     setup_tensorboard,
 )
 from trainer import trainer
-from utils import EMA, seed_all, select_device
+from utils import EMA, open_file, path_exists, seed_all, select_device, sync_tree
 from vae import HVAE
 
 
@@ -25,9 +26,10 @@ def main(args: Hparams):
     # update hyperparams if resuming from a checkpoint
     ckpt = None
     if args.resume:
-        if os.path.isfile(args.resume):
+        if path_exists(args.resume):
             print(f"\nLoading checkpoint: {args.resume}")
-            ckpt = torch.load(args.resume, map_location="cpu")
+            with open_file(args.resume, "rb") as f:
+                ckpt = torch.load(f, map_location="cpu")
             ckpt_args = {
                 k: v
                 for k, v in ckpt["hparams"].items()
@@ -64,7 +66,7 @@ def main(args: Hparams):
 
     # setup model save directory, logging and tensorboard summaries
     assert args.exp_name != "", "No experiment name given."
-    args.save_dir = setup_directories(args)
+    args.save_dir = setup_directories(args, ckpt_dir=args.ckpt_dir)
     writer = setup_tensorboard(args, model)
     logger = setup_logging(args)
 
@@ -111,6 +113,12 @@ def main(args: Hparams):
             if input(f"Send '{args.save_dir}' to Trash? [y/N]: ") == "y":
                 send2trash.send2trash(args.save_dir)
                 print("Done.")
+    finally:
+        writer.flush()
+        writer.close()
+        logging.shutdown()
+        if hasattr(args, "remote_save_dir"):
+            sync_tree(args.save_dir, args.remote_save_dir)
 
 
 if __name__ == "__main__":

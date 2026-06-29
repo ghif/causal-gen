@@ -1,6 +1,7 @@
 imageio==2.26.0
 matplotlib==3.7.1
 numpy==1.24.3
+gcsfs==2024.6.1
 pandas==1.5.3
 Pillow==10.2.0
 pyro_ppl==1.8.4

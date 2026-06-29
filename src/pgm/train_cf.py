@@ -21,7 +21,16 @@ sys.path.append("..")
 from datasets import get_attr_max_min
 from hps import Hparams
 from train_setup import setup_directories, setup_logging, setup_tensorboard
-from utils import EMA, seed_all, select_device
+from utils import (
+    EMA,
+    ensure_parent_dir,
+    open_file,
+    path_exists,
+    seed_all,
+    select_device,
+    sync_file,
+    sync_tree,
+)
 from vae import HVAE
 
 
@@ -243,6 +252,12 @@ if __name__ == "__main__":
         "--data_dir", help="data directory to load form.", type=str, default=""
     )
     parser.add_argument(
+        "--ckpt_dir",
+        help="Directory to store checkpoints.",
+        type=str,
+        default="gs://causal-gen/checkpoints",
+    )
+    parser.add_argument(
         "--load_path", help="Path to load checkpoint.", type=str, default=""
     )
     parser.add_argument(
@@ -302,9 +317,10 @@ if __name__ == "__main__":
 
     # update hparams if loading checkpoint
     if args.load_path:
-        if os.path.isfile(args.load_path):
+        if path_exists(args.load_path):
             print(f"\nLoading checkpoint: {args.load_path}")
-            ckpt = torch.load(args.load_path, map_location="cpu")
+            with open_file(args.load_path, "rb") as f:
+                ckpt = torch.load(f, map_location="cpu")
             ckpt_args = {
                 k: v
                 for k, v in ckpt["hparams"].items()
@@ -322,7 +338,8 @@ if __name__ == "__main__":
 
     # Load predictors
     print(f"\nLoading predictor checkpoint: {args.predictor_path}")
-    predictor_checkpoint = torch.load(args.predictor_path, map_location="cpu")
+    with open_file(args.predictor_path, "rb") as f:
+        predictor_checkpoint = torch.load(f, map_location="cpu")
     predictor_args = Hparams()
     predictor_args.update(predictor_checkpoint["hparams"])
     predictor_args.device = args.device
@@ -356,7 +373,8 @@ if __name__ == "__main__":
 
     # Load PGM
     print(f"\nLoading PGM checkpoint: {args.pgm_path}")
-    pgm_checkpoint = torch.load(args.pgm_path, map_location="cpu")
+    with open_file(args.pgm_path, "rb") as f:
+        pgm_checkpoint = torch.load(f, map_location="cpu")
     pgm_args = Hparams()
     pgm_args.update(pgm_checkpoint["hparams"])
     pgm_args.device = args.device
@@ -377,7 +395,8 @@ if __name__ == "__main__":
 
     # Load deep VAE
     print(f"\nLoading VAE checkpoint: {args.vae_path}")
-    vae_checkpoint = torch.load(args.vae_path, map_location="cpu")
+    with open_file(args.vae_path, "rb") as f:
+        vae_checkpoint = torch.load(f, map_location="cpu")
     vae_args = Hparams()
     vae_args.update(vae_checkpoint["hparams"])
     if not hasattr(vae_args, "cond_prior"):  # for backwards compatibility
@@ -451,7 +470,7 @@ if __name__ == "__main__":
 
     # Train model
     if not args.testing:
-        args.save_dir = setup_directories(args, ckpt_dir="../../checkpoints")
+        args.save_dir = setup_directories(args, ckpt_dir=args.ckpt_dir)
         writer = setup_tensorboard(args, model)
         logger = setup_logging(args)
         writer.add_custom_scalars(
@@ -482,7 +501,9 @@ if __name__ == "__main__":
 
         # load checkpoint
         if args.load_path:
-            if os.path.isfile(args.load_path):
+            if path_exists(args.load_path):
+                with open_file(args.load_path, "rb") as f:
+                    ckpt = torch.load(f, map_location="cpu")
                 args.start_epoch = ckpt["epoch"]
                 args.step = ckpt["step"]
                 args.best_loss = ckpt["best_loss"]
@@ -537,22 +558,32 @@ if __name__ == "__main__":
                 if valid_stats["loss"] < args.best_loss:
                     args.best_loss = valid_stats["loss"]
                     ckpt_path = os.path.join(
-                        args.save_dir, f"{args.step}_checkpoint.pt"
+                        args.save_dir,
+                        f"{args.step}_checkpoint.pt",
                     )
-                    torch.save(
-                        {
-                            "epoch": args.epoch,
-                            "step": args.step,
-                            "best_loss": args.best_loss,
-                            "model_state_dict": model.state_dict(),
-                            "ema_model_state_dict": ema.ema_model.state_dict(),
-                            "optimizer_state_dict": optimizer.state_dict(),
-                            "lagrange_opt_state_dict": lagrange_opt.state_dict(),
-                            "hparams": vars(args),
-                        },
+                    ensure_parent_dir(ckpt_path)
+                    with open_file(ckpt_path, "wb") as f:
+                        torch.save(
+                            {
+                                "epoch": args.epoch,
+                                "step": args.step,
+                                "best_loss": args.best_loss,
+                                "model_state_dict": model.state_dict(),
+                                "ema_model_state_dict": ema.ema_model.state_dict(),
+                                "optimizer_state_dict": optimizer.state_dict(),
+                                "lagrange_opt_state_dict": lagrange_opt.state_dict(),
+                                "hparams": vars(args),
+                            },
+                            f,
+                        )
+                    sync_file(
                         ckpt_path,
+                        os.path.join(args.remote_save_dir, f"{args.step}_checkpoint.pt"),
                     )
                     logger.info(f"Model saved: {ckpt_path}")
+                if hasattr(args, "remote_save_dir"):
+                    writer.flush()
+                    sync_tree(args.save_dir, args.remote_save_dir)
     else:
         # test model
         model.load_state_dict(ckpt["model_state_dict"])
