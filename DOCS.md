@@ -116,6 +116,45 @@ Key classes:
 - `DGaussNet`: discretized Gaussian likelihood head for image reconstruction
 - `HVAE`: full model wrapper that exposes `forward`, `sample`, `abduct`, and `forward_latents`
 
+The architecture is hierarchical and multi-scale. A compact view is:
+
+```mermaid
+flowchart LR
+  X["Input image x"] --> E0["Encoder stem<br/>7x7 conv"]
+  E0 --> E1["Encoder blocks<br/>residual conv blocks + downsampling"]
+  E1 --> A["Multi-scale activations {x_r}"]
+
+  P["Parents pa"] --> PR["Broadcast / crop parents per resolution"]
+
+  subgraph ENC["Encoder / inference path"]
+    X
+    E0
+    E1
+    A
+  end
+
+  subgraph DEC["Decoder / generative path"]
+    D0["Learned 1x1 bias state"]
+    B1["DecoderBlock at low resolution"]
+    B2["DecoderBlock at mid resolution"]
+    B3["DecoderBlock at high resolution"]
+    L["DGaussNet<br/>discretized Gaussian likelihood"]
+    D0 --> B1 --> B2 --> B3 --> L
+  end
+
+  A --> Q1["q(z1 | x, pa)"]
+  A --> Q2["q(z2 | x, pa)"]
+  A --> Q3["q(z3 | x, pa)"]
+
+  PR --> B1
+  PR --> B2
+  PR --> B3
+
+  Q1 --> B1
+  Q2 --> B2
+  Q3 --> B3
+```
+
 Paper correspondence:
 
 - Section 3.2: conditional HVAE with an exogenous prior
@@ -127,6 +166,9 @@ Implementation details worth knowing:
 - parent variables are injected at multiple resolutions through `parents`
 - the latent path can be interpreted either as exogenous noise or as a mediator, depending on the training setup
 - the likelihood is discretized and stable enough for high-resolution image training
+- `enc_arch` and `dec_arch` in `src/hps.py` define how many blocks appear at each resolution
+- `z_max_res` controls which decoder blocks are stochastic and which are deterministic
+- `cond_prior` makes the prior depend on the parents, which is what enables the latent-mediator style counterfactuals
 
 ### `src/simple_vae.py`
 

@@ -245,7 +245,7 @@ if __name__ == "__main__":
         help="Training accelerator.",
         type=str,
         default="auto",
-        choices=["auto", "cpu", "cuda", "mps"],
+        choices=["auto", "cpu", "cuda", "mps", "tpu", "xla"],
     )
     parser.add_argument("--exp_name", help="experiment name.", type=str, default="")
     parser.add_argument(

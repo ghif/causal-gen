@@ -98,7 +98,7 @@ def add_arguments(parser: argparse.ArgumentParser):
         help="Training accelerator.",
         type=str,
         default="auto",
-        choices=["auto", "cpu", "cuda", "mps"],
+        choices=["auto", "cpu", "cuda", "mps", "tpu", "xla"],
     )
     parser.add_argument("--exp_name", help="Experiment name.", type=str, default="")
     parser.add_argument(
