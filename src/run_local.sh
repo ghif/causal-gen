@@ -9,6 +9,13 @@ if [ "${CONDA_DEFAULT_ENV:-}" != "med-torch" ]; then
   conda activate med-torch
 fi
 
+# Some TPU VM launch environments populate TPU_WORKER_HOSTNAMES with a warning
+# string instead of an address list. Unset that value so torch_xla can either
+# discover the worker topology correctly or fail with a cleaner error.
+if [[ "${TPU_WORKER_HOSTNAMES:-}" == WARNING:* ]]; then
+  unset TPU_WORKER_HOSTNAMES
+fi
+
 exp_name="${1:-local_run_$(date +%Y%m%d_%H%M%S)}"
 extra_args=()
 run_nohup=false
@@ -23,8 +30,8 @@ done
 
 run_cmd=(python main.py
   --exp_name="$exp_name"
-  --data_dir=gs://causal-gen/datasets/morphomnist
-  --ckpt_dir=gs://causal-gen/checkpoints
+  --data_dir=gs://medical-airnd/causal-gen/datasets/morphomnist
+  --ckpt_dir=gs://medical-airnd/causal-gen/checkpoints
   --hps morphomnist
   --parents_x thickness intensity digit
   --context_dim=12

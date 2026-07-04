@@ -299,7 +299,7 @@ class MorphoMNIST(Dataset):
 def morphomnist(args: Hparams) -> Dict[str, MorphoMNIST]:
     # Load data
     if not args.data_dir:
-        args.data_dir = "gs://causal-gen/datasets/morphomnist"
+        args.data_dir = "gs://medical-airnd/causal-gen/datasets/morphomnist"
 
     augmentation = {
         "train": TF.Compose(

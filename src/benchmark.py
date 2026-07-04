@@ -16,7 +16,7 @@ def run_benchmark():
     parser.set_defaults(
         hps="morphomnist",
         exp_name="benchmark_run",
-        data_dir="gs://causal-gen/datasets/morphomnist",
+        data_dir="gs://medical-airnd/causal-gen/datasets/morphomnist",
     )
     args = setup_hparams(parser)
 
