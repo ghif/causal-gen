@@ -30,6 +30,74 @@ def _load_xla():
     return xm
 
 
+def _prepare_tpu_environment() -> None:
+    """Set TPU env defaults required by torch-xla before importing it."""
+    if os.environ.get("PJRT_DEVICE", "").upper() != "TPU":
+        return
+
+    # torch-xla consults the Cloud TPU metadata service unless this is set.
+    # On TPU VMs the metadata lookup is sometimes unavailable from the runtime
+    # environment, so we prefer env-based configuration when launching locally.
+    os.environ.setdefault("TPU_SKIP_MDS_QUERY", "1")
+
+    # torch-xla's env-based path reads TPU_ACCELERATOR_TYPE, but the import-time
+    # checks also expect ACCELERATOR_TYPE to exist. Mirror either one into the
+    # other so both code paths work.
+    accelerator_type = os.environ.get("ACCELERATOR_TYPE") or os.environ.get(
+        "TPU_ACCELERATOR_TYPE"
+    )
+    if accelerator_type is None:
+        # Conservative default for TPU VM v6e hosts. Users can override this by
+        # exporting ACCELERATOR_TYPE or TPU_ACCELERATOR_TYPE before launching.
+        accelerator_type = "v6e-8"
+
+    os.environ.setdefault("ACCELERATOR_TYPE", accelerator_type)
+    os.environ.setdefault("TPU_ACCELERATOR_TYPE", accelerator_type)
+
+    # When metadata is unavailable, torch-xla also needs topology values that
+    # are normally derived from the TPU VM environment. Use the number of local
+    # TPU chips visible in sysfs as the single-host process bound.
+    tpu_vendor = "0x1ae0"
+    tpu_device_ids = {"0x0027", "0x005e", "0x0063", "0x006f", "0x0056", "0x0062"}
+    num_chips = 0
+    try:
+        for device_name in os.listdir("/sys/bus/pci/devices"):
+            device_dir = os.path.join("/sys/bus/pci/devices", device_name)
+            vendor_file = os.path.join(device_dir, "vendor")
+            device_file = os.path.join(device_dir, "device")
+            if not os.path.isfile(vendor_file) or not os.path.isfile(device_file):
+                continue
+            with open(vendor_file) as f:
+                vendor_id = f.read().strip()
+            if vendor_id != tpu_vendor:
+                continue
+            with open(device_file) as f:
+                device_id = f.read().strip()
+            if device_id in tpu_device_ids:
+                num_chips += 1
+    except OSError:
+        num_chips = 0
+
+    if num_chips <= 0:
+        num_chips = 1
+
+    worker_host = "127.0.0.1"
+    worker_hosts = ",".join([worker_host] * num_chips)
+    os.environ.setdefault("TPU_WORKER_HOSTNAMES", worker_hosts)
+    os.environ.setdefault("TPU_WORKER_ID", "0")
+
+    # Some libtpu/PJRT builds expect an explicit worker-address list even on a
+    # single-host slice. Synthesize the local host layout with one port per chip.
+    process_ports = [8476 + i for i in range(num_chips)]
+    process_addresses = ",".join(f"{worker_host}:{port}" for port in process_ports)
+    os.environ.setdefault("TPU_PROCESS_ADDRESSES", process_addresses)
+
+    if os.environ.get("TPU_PROCESS_BOUNDS") is None:
+        os.environ["TPU_PROCESS_BOUNDS"] = f"{num_chips},1,1"
+
+    os.environ.setdefault("TPU_CHIPS_PER_PROCESS_BOUNDS", "1,1,1")
+
+
 def tpu_environment_available() -> bool:
     if os.environ.get("PJRT_DEVICE", "").upper() == "TPU":
         try:
@@ -138,12 +206,15 @@ def wrap_loader(loader: Iterable, device: torch.device) -> Iterable:
     return MpDeviceLoader(loader, device)
 
 
-def launch(function, args=()):
+def launch(function, args=(), debug_single_process: bool = False):
+    _prepare_tpu_environment()
     try:
         import torch_xla
     except ImportError:
         _load_xla()
-    return torch_xla.launch(function, args=args)
+    return torch_xla.launch(
+        function, args=args, debug_single_process=debug_single_process
+    )
 
 
 def save(data: Any, path: str, device: torch.device) -> None:

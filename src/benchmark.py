@@ -8,7 +8,7 @@ from trainer import preprocess_batch
 from train_setup import setup_dataloaders, setup_optimizer
 from utils import EMA, seed_all, select_device
 from vae import HVAE
-from xla_runtime import autocast, optimizer_step, synchronize
+from xla_runtime import autocast, mark_step, optimizer_step, synchronize
 
 def run_benchmark():
     parser = argparse.ArgumentParser()
@@ -17,7 +17,7 @@ def run_benchmark():
     parser.set_defaults(
         hps="morphomnist",
         exp_name="benchmark_run",
-        data_dir="gs://causal-gen/datasets/morphomnist",
+        data_dir="gs://medical-airnd/causal-gen/datasets/morphomnist",
     )
     args = setup_hparams(parser)
 
@@ -69,11 +69,17 @@ def run_benchmark():
         out["elbo"].backward()
 
         # Optimizer step
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        if args.device.type == "xla":
+            grad_norm = torch.tensor(0.0, device=args.device)
+        else:
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), args.grad_clip
+            )
         optimizer_step(optimizer, args.device)
         scheduler.step()
         ema.update()
         model.zero_grad(set_to_none=True)
+        mark_step(args.device)
         print(f"Warmup step {i+1}/{warmup_steps} completed.")
 
     print("Starting timed steps...")
@@ -93,11 +99,17 @@ def run_benchmark():
         out["elbo"] = out["elbo"] / args.accu_steps
         out["elbo"].backward()
 
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        if args.device.type == "xla":
+            grad_norm = torch.tensor(0.0, device=args.device)
+        else:
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), args.grad_clip
+            )
         optimizer_step(optimizer, args.device)
         scheduler.step()
         ema.update()
         model.zero_grad(set_to_none=True)
+        mark_step(args.device)
 
         synchronize(args.device)
 

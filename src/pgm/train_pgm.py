@@ -390,7 +390,7 @@ if __name__ == "__main__":
         "--ckpt_dir",
         help="Directory to store checkpoints.",
         type=str,
-        default="gs://causal-gen/checkpoints",
+        default="gs://medical-airnd/causal-gen/checkpoints",
     )
     parser.add_argument(
         "--load_path", help="Path to load checkpoint.", type=str, default=""

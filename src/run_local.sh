@@ -23,8 +23,8 @@ done
 
 run_cmd=(python main.py
   --exp_name="$exp_name"
-  --data_dir=gs://causal-gen/datasets/morphomnist
-  --ckpt_dir=gs://causal-gen/checkpoints
+  --data_dir=gs://medical-airnd/causal-gen/datasets/morphomnist
+  --ckpt_dir=gs://medical-airnd/causal-gen/checkpoints
   --hps morphomnist
   --parents_x thickness intensity digit
   --context_dim=12
