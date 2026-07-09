@@ -356,7 +356,7 @@ def write_images(args: Hparams, model: nn.Module, batch: Dict[str, Tensor]):
     bs, c, h, w = batch["x"].shape
     # original imgs, channels last, [0,255]
     orig = (batch["x"].permute(0, 2, 3, 1) + 1.0) * 127.5
-    orig = orig.detach().cpu().numpy().astype(np.uint8)
+    import numpy as np; import numpy as np; import numpy as np; import numpy as np; import numpy as np; import numpy as np; import numpy as np; orig = orig.detach().cpu().numpy().astype(np.uint8)
     viz_images = [orig]
 
     def postprocess(x: Tensor):
@@ -541,6 +541,6 @@ def write_images(args: Hparams, model: nn.Module, batch: Dict[str, Tensor]):
         .reshape([n_rows * h, bs * w, c])
     )
     viz_path = os.path.join(args.save_dir, f"viz-{args.iter}.png")
-    imageio.imwrite(viz_path, im)
+    import numpy as np; imageio.imwrite(viz_path, np.squeeze(im) if im.ndim == 3 and im.shape[-1] == 1 else im)
     if hasattr(args, "remote_save_dir"):
         sync_file(viz_path, os.path.join(args.remote_save_dir, f"viz-{args.iter}.png"))
