@@ -321,37 +321,47 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
                     checkpoint_smoke_test(args, state, tx, logger)
                     return
 
-        valid_batch = preprocess_batch(args, next(valid_iter), expand_pa=True)
-        valid_beta = args.beta * (float(beta_warmup(state.step)) if beta_warmup is not None else 1.0)
-        valid_out = eval_step_fn(state.ema.params, valid_batch, valid_beta, jax.random.PRNGKey(args.seed + epoch))
-        _block_until_ready(valid_out)
-        if float(valid_out["elbo"]) < state.best_loss:
-            state.best_loss = float(valid_out["elbo"])
-            save_state(args, state, tx, epoch + 1)
-        if hasattr(writer, "add_scalar"):
-            writer.add_scalar("train/elbo", train_loss_sum / max(1, steps_per_epoch), epoch + 1)
-            writer.add_scalar("valid/elbo", float(valid_out["elbo"]), epoch + 1)
-        if args.viz_freq and not getattr(args, "checkpoint_smoke_test", False) and (epoch + 1) % args.viz_freq == 0:
-            viz_path = write_images(
-                args,
-                graphdef,
-                state.ema.params,
-                valid_batch,
-                jax.random.PRNGKey(args.seed + epoch),
-                step=state.step,
-            )
-            logger.info("viz_image=%s", viz_path)
         epoch_time = time.perf_counter() - t0
         epoch_iter_per_sec = steps_per_epoch / max(epoch_time, 1e-12)
         epoch_sample_per_sec = steps_per_epoch * args.bs / max(epoch_time, 1e-12)
-        logger.info(
-            "epoch=%d valid_elbo=%.4f epoch_time=%.1fs epoch_iter/s=%.3f epoch_sample/s=%.3f",
-            epoch + 1,
-            float(valid_out["elbo"]),
-            epoch_time,
-            epoch_iter_per_sec,
-            epoch_sample_per_sec,
-        )
+        if hasattr(writer, "add_scalar"):
+            writer.add_scalar("train/elbo", train_loss_sum / max(1, steps_per_epoch), epoch + 1)
+        if epoch % max(1, args.eval_freq) == 0:
+            valid_batch = preprocess_batch(args, next(valid_iter), expand_pa=True)
+            valid_beta = args.beta * (float(beta_warmup(state.step)) if beta_warmup is not None else 1.0)
+            valid_out = eval_step_fn(state.ema.params, valid_batch, valid_beta, jax.random.PRNGKey(args.seed + epoch))
+            _block_until_ready(valid_out)
+            if float(valid_out["elbo"]) < state.best_loss:
+                state.best_loss = float(valid_out["elbo"])
+                save_state(args, state, tx, epoch + 1)
+            if hasattr(writer, "add_scalar"):
+                writer.add_scalar("valid/elbo", float(valid_out["elbo"]), epoch + 1)
+            if args.viz_freq and not getattr(args, "checkpoint_smoke_test", False) and (epoch + 1) % args.viz_freq == 0:
+                viz_path = write_images(
+                    args,
+                    graphdef,
+                    state.ema.params,
+                    valid_batch,
+                    jax.random.PRNGKey(args.seed + epoch),
+                    step=state.step,
+                )
+                logger.info("viz_image=%s", viz_path)
+            logger.info(
+                "epoch=%d valid_elbo=%.4f epoch_time=%.1fs epoch_iter/s=%.3f epoch_sample/s=%.3f",
+                epoch + 1,
+                float(valid_out["elbo"]),
+                epoch_time,
+                epoch_iter_per_sec,
+                epoch_sample_per_sec,
+            )
+        else:
+            logger.info(
+                "epoch=%d epoch_time=%.1fs epoch_iter/s=%.3f epoch_sample/s=%.3f",
+                epoch + 1,
+                epoch_time,
+                epoch_iter_per_sec,
+                epoch_sample_per_sec,
+            )
         if getattr(args, "checkpoint_smoke_test", False) and state.step >= max(1, args.checkpoint_smoke_steps):
             checkpoint_smoke_test(args, state, tx, logger)
             return

@@ -54,7 +54,7 @@ run_cmd=(python -u main.py
   --context_dim=12
   --concat_pa
   --lr=0.001
-  --bs=128
+  --bs=32
   --wd=0.01
   --beta=1
   --cond_prior

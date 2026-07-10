@@ -361,7 +361,6 @@ def write_images(args, model, params, batch, rng_key=None, step: Optional[int] =
     def _append_counterfactual_rows(zs, pa_ctx, cf_pa_ctx, x_ctx, alpha, t):
         x_rec, _ = model.forward_latents(latents=zs, parents=pa_ctx, t=t)
         x_rec = postprocess(x_rec)
-        rows.append(x_rec.astype(np.uint8))
 
         cf_x, _ = model.forward_latents(latents=zs, parents=cf_pa_ctx, t=t)
         cf_x = postprocess(cf_x)
@@ -372,14 +371,13 @@ def write_images(args, model, params, batch, rng_key=None, step: Optional[int] =
             # Match the Torch visualization path: re-abduct on the counterfactual parents
             # and show the indirect and total effect rows as well.
             cf_z = model.abduct(x=x_ctx, parents=pa_ctx, cf_parents=cf_pa_ctx, alpha=alpha, t=t)
-            indirect_zs = [z["z"] for z in cf_z]
 
-            x_indirect, _ = model.forward_latents(latents=indirect_zs, parents=pa_ctx, t=t)
+            x_indirect, _ = model.forward_latents(latents=cf_z, parents=pa_ctx, t=t)
             x_indirect = postprocess(x_indirect)
             rows.append(x_indirect.astype(np.uint8))
             rows.append((x_indirect - x_rec).astype(np.uint8))
 
-            x_total, _ = model.forward_latents(latents=indirect_zs, parents=cf_pa_ctx, t=t)
+            x_total, _ = model.forward_latents(latents=cf_z, parents=cf_pa_ctx, t=t)
             x_total = postprocess(x_total)
             rows.append(x_total.astype(np.uint8))
             rows.append((x_total - x_rec).astype(np.uint8))
@@ -402,7 +400,6 @@ def write_images(args, model, params, batch, rng_key=None, step: Optional[int] =
     for temp in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]:
         sample, _ = model.sample(parents=pa_jax, return_loc=True, t=temp, rng=rng_key)
         rows.append(postprocess(sample))
-    rows.append(postprocess(x * 0))
 
     if "morphomnist" in getattr(args, "hps", ""):
         base_pa = np.asarray(batch["pa"])[:bs]

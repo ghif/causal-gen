@@ -43,9 +43,9 @@ HPARAMS_REGISTRY["morphomnist"] = _make_hparams(
     data_dir="gs://medical-airnd/causal-gen/datasets/morphomnist",
     hps="morphomnist",
     vae="hierarchical",
-    x_like="none_dgauss",
-    std_init=0.1,
-    q_correction=True,
+    x_like="diag_dgauss",
+    std_init=0.0,
+    q_correction=False,
     beta=1.0,
     kl_free_bits=0.0,
     beta_warmup_steps=0,
@@ -111,13 +111,14 @@ def add_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--bottleneck", type=int, default=4)
     parser.add_argument("--z_dim", type=int, default=16)
     parser.add_argument("--z_max_res", type=int, default=192)
-    parser.add_argument("--bias_max_res", type=int, default=192)
+    parser.add_argument("--bias_max_res", type=int, default=64)
     parser.add_argument("--context_dim", type=int, default=12)
     parser.add_argument("--context_norm", type=str, default="[-1,1]")
     parser.add_argument("--parents_x", nargs="+", default=["thickness", "intensity", "digit"])
     parser.add_argument("--concat_pa", action="store_true", default=True)
-    parser.add_argument("--x_like", type=str, default="none_dgauss")
-    parser.add_argument("--std_init", type=float, default=0.1)
+    parser.add_argument("--x_like", type=str, default="diag_dgauss")
+    parser.add_argument("--std_init", type=float, default=0.0)
+    parser.add_argument("--q_correction", action="store_true", default=False)
     parser.add_argument("--dataset", type=str, default="morphomnist")
     return parser
 
