@@ -9,11 +9,10 @@ if [ "${CONDA_DEFAULT_ENV:-}" != "med-jax" ]; then
   conda activate med-jax
 fi
 
-export JAX_PLATFORMS=cpu
-export JAX_PLATFORM_NAME=cpu
-export CUDA_VISIBLE_DEVICES=""
+unset JAX_PLATFORMS
+unset JAX_PLATFORM_NAME
 
-exp_name="${1:-local_run_$(date +%Y%m%d_%H%M%S)}"
+exp_name="${1:-gpu_run_$(date +%Y%m%d_%H%M%S)}"
 extra_args=()
 run_nohup=false
 run_smoke=false
@@ -32,7 +31,7 @@ if [ "$run_smoke" = true ]
 then
   extra_args+=(
     --epochs=1
-    --viz_freq=0
+    --viz_freq=1
     --checkpoint_smoke_test
     --checkpoint_smoke_steps=1
     --eval_freq=1000000
@@ -40,8 +39,8 @@ then
 fi
 
 run_cmd=(python -u main.py
-  --accelerator=cpu
-  --precision=fp32
+  --accelerator=gpu
+  --precision=bf16
   --exp_name="$exp_name"
   --data_dir=gs://medical-airnd/causal-gen/datasets/morphomnist
   --ckpt_dir=../checkpoints

@@ -1,12 +1,8 @@
 from __future__ import annotations
 
-import os
-os.environ.setdefault("JAX_PLATFORMS", "cpu")
-os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
-
-import copy
 import json
 import io
+import os
 import random
 import shutil
 import tempfile
@@ -14,6 +10,10 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Iterator, Optional, Sequence, Tuple
 
 import time
+
+from runtime import configure_backend_from_argv
+
+configure_backend_from_argv()
 
 import imageio.v2 as imageio
 import jax
@@ -314,6 +314,9 @@ def batch_iterator(dataset, batch_size: int, shuffle: bool, seed: int) -> Iterat
             rng.shuffle(indices)
         for start in range(0, len(indices), batch_size):
             batch_idx = indices[start : start + batch_size]
+            if hasattr(dataset, "make_batch"):
+                yield dataset.make_batch(batch_idx, rng=rng, shuffle=shuffle)
+                continue
             batch = [dataset[int(i)] for i in batch_idx]
             keys = batch[0].keys()
             out = {}
