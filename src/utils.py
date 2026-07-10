@@ -283,17 +283,27 @@ def postprocess(x):
 
 
 def make_image_grid(images: Sequence[np.ndarray], n_rows: int, n_cols: int) -> np.ndarray:
-    imgs = [np.asarray(img) for img in images]
-    if imgs[0].ndim == 3 and imgs[0].shape[-1] == 1:
-        imgs = [img[..., 0] for img in imgs]
-    h, w = imgs[0].shape[:2]
-    c = 1 if imgs[0].ndim == 2 else imgs[0].shape[2]
-    grid = np.zeros((n_rows * h, n_cols * w, c), dtype=np.uint8)
-    for idx, img in enumerate(imgs):
-        r = idx // n_cols
-        cidx = idx % n_cols
-        grid[r * h : (r + 1) * h, cidx * w : (cidx + 1) * w] = _to_uint8_image(img)
-    return grid.squeeze(-1) if grid.shape[-1] == 1 else grid
+    rows = [np.asarray(img) for img in images]
+    if rows[0].ndim == 3:
+        rows = [row[None, ...] for row in rows]
+    if rows[0].ndim != 4:
+        raise ValueError(f"Expected 4D row tensors, got shape {rows[0].shape}.")
+    n_cols = min(n_cols, rows[0].shape[0])
+    h, w = rows[0].shape[1:3]
+    c = rows[0].shape[-1]
+    padded_rows = []
+    for row in rows:
+        if row.shape[0] < n_cols:
+            pad = np.zeros((n_cols - row.shape[0], h, w, c), dtype=row.dtype)
+            row = np.concatenate([row, pad], axis=0)
+        padded_rows.append(row[:n_cols])
+    im = (
+        np.concatenate(padded_rows, axis=0)
+        .reshape((n_rows, n_cols, h, w, c))
+        .transpose([0, 2, 1, 3, 4])
+        .reshape([n_rows * h, n_cols * w, c])
+    )
+    return im.squeeze(-1) if im.ndim == 3 and im.shape[-1] == 1 else im
 
 
 def batch_iterator(dataset, batch_size: int, shuffle: bool, seed: int) -> Iterator[Dict[str, np.ndarray]]:
@@ -313,29 +323,44 @@ def batch_iterator(dataset, batch_size: int, shuffle: bool, seed: int) -> Iterat
             yield out
 
 
-def write_images(args, model, params, batch, rng_key=None):
+def write_images(args, model, params, batch, rng_key=None, step: Optional[int] = None):
     import matplotlib.pyplot as plt
 
     x = np.asarray(batch["x"])
     pa = np.asarray(batch["pa"])
     if x.ndim == 4 and x.shape[1] in (1, 3):
         x = np.transpose(x, (0, 2, 3, 1))
-    if pa.ndim == 2 and getattr(args, "vae", "hierarchical") == "hierarchical":
-        pa = pa[:, :, None, None]
-        pa = np.repeat(pa, args.input_res, axis=2)
-        pa = np.repeat(pa, args.input_res, axis=3)
+    if pa.ndim == 4 and pa.shape[1] in (1, 3):
         pa = np.transpose(pa, (0, 2, 3, 1))
     model = materialize_nnx(model, params)
-    images = [postprocess(x)]
-    sample, _ = model.sample(parents=batch["pa"], return_loc=True, rng=rng_key)
-    if sample.ndim == 4 and sample.shape[1] in (1, 3):
-        sample = np.transpose(sample, (0, 2, 3, 1))
-    images.append(postprocess(sample))
-    grid = make_image_grid(images, n_rows=len(images), n_cols=x.shape[0])
-    viz_path = os.path.join(args.save_dir, f"viz-{args.iter}.png")
+    n = min(getattr(args, "context_dim", x.shape[0]) * 5, x.shape[0])
+    x = x[:n]
+    pa = pa[:n]
+    rows = [postprocess(x)]
+    try:
+        zs = model.abduct(x=batch["x"][:n], parents=batch["pa"][:n])
+        latents = [z["z"] if isinstance(z, dict) and "z" in z else z for z in zs]
+        if len(latents) > 0:
+            x_rec, _ = model.forward_latents(latents=latents, parents=batch["pa"][:n], t=0.1)
+            if x_rec.ndim == 4 and x_rec.shape[1] in (1, 3):
+                x_rec = np.transpose(np.asarray(x_rec), (0, 2, 3, 1))
+            rows.append(postprocess(x_rec))
+    except AttributeError:
+        pass
+    rows.append(postprocess(x * 0))
+    for temp in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]:
+        sample, _ = model.sample(parents=batch["pa"][:n], return_loc=True, t=temp, rng=rng_key)
+        if sample.ndim == 4 and sample.shape[1] in (1, 3):
+            sample = np.transpose(np.asarray(sample), (0, 2, 3, 1))
+        rows.append(postprocess(sample))
+    rows.append(postprocess(x * 0))
+    grid = make_image_grid(rows, n_rows=len(rows), n_cols=n)
+    viz_step = int(step if step is not None else getattr(args, "iter", 0))
+    viz_path = os.path.join(args.save_dir, f"viz-{viz_step}.png")
     imageio.imwrite(viz_path, grid)
     if hasattr(args, "remote_save_dir"):
-        sync_file(viz_path, os.path.join(args.remote_save_dir, f"viz-{args.iter}.png"))
+        sync_file(viz_path, os.path.join(args.remote_save_dir, f"viz-{viz_step}.png"))
+    return viz_path
 
 
 class SummaryWriter:

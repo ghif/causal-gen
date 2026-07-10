@@ -16,14 +16,28 @@ export CUDA_VISIBLE_DEVICES=""
 exp_name="${1:-local_run_$(date +%Y%m%d_%H%M%S)}"
 extra_args=()
 run_nohup=false
+run_smoke=false
 
 for arg in "${@:2}"; do
   if [ "$arg" = "nohup" ]; then
     run_nohup=true
+  elif [ "$arg" = "smoke" ]; then
+    run_smoke=true
   else
     extra_args+=("$arg")
   fi
 done
+
+if [ "$run_smoke" = true ]
+then
+  extra_args+=(
+    --epochs=1
+    --viz_freq=0
+    --checkpoint_smoke_test
+    --checkpoint_smoke_steps=1
+    --eval_freq=1000000
+  )
+fi
 
 run_cmd=(python -u main.py
   --exp_name="$exp_name"

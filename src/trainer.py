@@ -183,9 +183,16 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
                     writer.add_scalar("speed/epoch_iter_per_sec", epoch_iters_per_sec, state.step)
                     writer.add_scalar("speed/epoch_sample_per_sec", epoch_samples_per_sec, state.step)
                     writer.add_scalar("speed/eta_sec", eta_sec, state.step)
-            if getattr(args, "checkpoint_smoke_test", False) and state.step >= max(1, args.checkpoint_smoke_steps):
-                checkpoint_smoke_test(args, state, tx, logger)
-                return
+            if getattr(args, "checkpoint_smoke_test", False):
+                viz_path = write_images(
+                    args,
+                    graphdef,
+                    state.ema.params,
+                    batch,
+                    jax.random.PRNGKey(args.seed + state.step),
+                    step=state.step,
+                )
+                logger.info("viz_image=%s", viz_path)
         valid_batch = preprocess_batch(args, next(valid_iter), expand_pa=True)
         valid_out = eval_step(graphdef, state.ema.params, valid_batch, args, jax.random.PRNGKey(args.seed + epoch))
         if float(valid_out["elbo"]) < state.best_loss:
@@ -194,8 +201,16 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
         if hasattr(writer, "add_scalar"):
             writer.add_scalar("train/elbo", float(jnp.mean(jnp.array([o["elbo"] for o in train_stats]))), epoch + 1)
             writer.add_scalar("valid/elbo", float(valid_out["elbo"]), epoch + 1)
-        if args.viz_freq and (epoch + 1) % args.viz_freq == 0:
-            write_images(args, graphdef, state.ema.params, valid_batch, jax.random.PRNGKey(args.seed + epoch))
+        if args.viz_freq and (epoch + 1) % args.viz_freq == 0 and not getattr(args, "checkpoint_smoke_test", False):
+            viz_path = write_images(
+                args,
+                graphdef,
+                state.ema.params,
+                valid_batch,
+                jax.random.PRNGKey(args.seed + epoch),
+                step=epoch + 1,
+            )
+            logger.info("viz_image=%s", viz_path)
         epoch_time = time.perf_counter() - t0
         epoch_iter_per_sec = steps_per_epoch / max(epoch_time, 1e-12)
         epoch_sample_per_sec = steps_per_epoch * args.bs / max(epoch_time, 1e-12)
@@ -207,3 +222,6 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
             epoch_iter_per_sec,
             epoch_sample_per_sec,
         )
+        if getattr(args, "checkpoint_smoke_test", False) and state.step >= max(1, args.checkpoint_smoke_steps):
+            checkpoint_smoke_test(args, state, tx, logger)
+            return
