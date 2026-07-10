@@ -290,8 +290,8 @@ def _ensure_nhwc(images: np.ndarray) -> np.ndarray:
 
 
 def _repeat_batch(value: np.ndarray, count: int) -> np.ndarray:
-    value = np.asarray(value)
-    return np.repeat(value[None, ...], count, axis=0)
+    value = jnp.asarray(value)
+    return jnp.repeat(value[None, ...], count, axis=0)
 
 
 def _morphomnist_counterfactual_parents(base_pa: np.ndarray, source_idx: int, target_idx: int, context_dim: int, input_res: int) -> tuple[np.ndarray, np.ndarray]:
@@ -299,9 +299,9 @@ def _morphomnist_counterfactual_parents(base_pa: np.ndarray, source_idx: int, ta
     cf_pa = pa.copy()
     cf_pa[0, 0] = base_pa[target_idx, 0]
     cf_pa[1, 1] = base_pa[target_idx, 1]
-    cf_pa[2:, 2:] = np.eye(10, dtype=cf_pa.dtype)
-    pa = np.repeat(np.repeat(pa[:, None, None, :], input_res, axis=1), input_res, axis=2)
-    cf_pa = np.repeat(np.repeat(cf_pa[:, None, None, :], input_res, axis=1), input_res, axis=2)
+    cf_pa = cf_pa.at[2:, 2:].set(jnp.eye(10, dtype=cf_pa.dtype))
+    pa = jnp.repeat(jnp.repeat(pa[:, None, None, :], input_res, axis=1), input_res, axis=2)
+    cf_pa = jnp.repeat(jnp.repeat(cf_pa[:, None, None, :], input_res, axis=1), input_res, axis=2)
     return pa, cf_pa
 
 
@@ -350,7 +350,7 @@ def batch_iterator(dataset, batch_size: int, shuffle: bool, seed: int) -> Iterat
 
 
 def write_images(args, model, params, batch, rng_key=None, step: Optional[int] = None):
-    x = _ensure_nhwc(batch["x"])
+    x = _ensure_nhwc(np.asarray(batch["x"]))
     model = materialize_nnx(model, params)
     bs = int(x.shape[0])
     rows = [postprocess(x)]
@@ -382,7 +382,9 @@ def write_images(args, model, params, batch, rng_key=None, step: Optional[int] =
             rows.append((x_total - x_rec).astype(np.uint8))
 
     try:
-        zs = model.abduct(x=batch["x"], parents=batch["pa"])
+        x_jax = jnp.asarray(batch["x"])
+        pa_jax = jnp.asarray(batch["pa"])
+        zs = model.abduct(x=x_jax, parents=pa_jax)
         n_latents_viz = 0
         l_points = np.floor(np.linspace(0, 1, n_latents_viz + 2) * len(zs)).astype(int)[1:]
         for l in l_points:
@@ -390,14 +392,14 @@ def write_images(args, model, params, batch, rng_key=None, step: Optional[int] =
                 latents = [zs[i]["z"] for i in range(l)]
             else:
                 latents = zs[:l]
-            x_rec, _ = model.forward_latents(latents=latents, parents=batch["pa"], t=0.1)
+            x_rec, _ = model.forward_latents(latents=latents, parents=pa_jax, t=0.1)
             rows.append(postprocess(x_rec))
     except AttributeError:
         pass
 
     rows.append(postprocess(x * 0))
     for temp in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]:
-        sample, _ = model.sample(parents=batch["pa"], return_loc=True, t=temp, rng=rng_key)
+        sample, _ = model.sample(parents=jnp.asarray(batch["pa"]), return_loc=True, t=temp, rng=rng_key)
         rows.append(postprocess(sample))
     rows.append(postprocess(x * 0))
 
@@ -427,10 +429,10 @@ def write_images(args, model, params, batch, rng_key=None, step: Optional[int] =
                     if getattr(model, "cond_prior", False):
                         z_dict = {}
                         for k, v in z.items():
-                            z_dict[k] = _repeat_batch(np.asarray(v[ii]), args.context_dim)
+                            z_dict[k] = _repeat_batch(v[ii], args.context_dim)
                         z_i.append(z_dict)
                     else:
-                        z_i.append(_repeat_batch(np.asarray(z[ii]), args.context_dim))
+                        z_i.append(_repeat_batch(z[ii], args.context_dim))
                 if getattr(model, "cond_prior", False):
                     latents = [z_i[j]["z"] for j in range(l)]
                 else:
