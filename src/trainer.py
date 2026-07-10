@@ -96,11 +96,24 @@ def make_eval_step(graphdef):
 
 
 def _tree_allclose(a, b, atol: float = 1e-6, rtol: float = 1e-6) -> bool:
+    if jax.tree_util.tree_structure(a) != jax.tree_util.tree_structure(b):
+        return False
     a_leaves = jax.tree_util.tree_leaves(a)
     b_leaves = jax.tree_util.tree_leaves(b)
     if len(a_leaves) != len(b_leaves):
         return False
-    return all(np.allclose(np.asarray(x), np.asarray(y), atol=atol, rtol=rtol) for x, y in zip(a_leaves, b_leaves))
+    for a_leaf, b_leaf in zip(a_leaves, b_leaves):
+        if isinstance(a_leaf, (np.ndarray, jax.Array)) or isinstance(b_leaf, (np.ndarray, jax.Array)):
+            if not np.allclose(np.asarray(a_leaf), np.asarray(b_leaf), atol=atol, rtol=rtol):
+                return False
+            continue
+        if type(a_leaf) is not type(b_leaf):
+            return False
+        if a_leaf == b_leaf:
+            continue
+        if repr(a_leaf) != repr(b_leaf):
+            return False
+    return True
 
 
 def checkpoint_smoke_test(args, state: TrainState, tx, logger) -> None:
@@ -216,6 +229,21 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
                     writer.add_scalar("speed/epoch_sample_per_sec", epoch_samples_per_sec, state.step)
                     writer.add_scalar("speed/eta_sec", eta_sec, state.step)
 
+            if getattr(args, "checkpoint_smoke_test", False):
+                if args.viz_freq:
+                    viz_path = write_images(
+                        args,
+                        graphdef,
+                        state.ema.params,
+                        batch,
+                        jax.random.PRNGKey(args.seed + state.step),
+                        step=state.step,
+                    )
+                    logger.info("viz_image=%s", viz_path)
+                if state.step >= max(1, args.checkpoint_smoke_steps):
+                    checkpoint_smoke_test(args, state, tx, logger)
+                    return
+
         valid_batch = preprocess_batch(args, next(valid_iter), expand_pa=True)
         valid_beta = args.beta * (float(beta_warmup(state.step)) if beta_warmup is not None else 1.0)
         valid_out = eval_step_fn(state.ema.params, valid_batch, valid_beta, jax.random.PRNGKey(args.seed + epoch))
@@ -225,7 +253,7 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
         if hasattr(writer, "add_scalar"):
             writer.add_scalar("train/elbo", train_loss_sum / max(1, steps_per_epoch), epoch + 1)
             writer.add_scalar("valid/elbo", float(valid_out["elbo"]), epoch + 1)
-        if args.viz_freq and (epoch + 1) % args.viz_freq == 0:
+        if args.viz_freq and not getattr(args, "checkpoint_smoke_test", False) and (epoch + 1) % args.viz_freq == 0:
             viz_path = write_images(
                 args,
                 graphdef,

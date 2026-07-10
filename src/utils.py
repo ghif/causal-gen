@@ -297,8 +297,8 @@ def _repeat_batch(value: np.ndarray, count: int) -> np.ndarray:
 def _morphomnist_counterfactual_parents(base_pa: np.ndarray, source_idx: int, target_idx: int, context_dim: int, input_res: int) -> tuple[np.ndarray, np.ndarray]:
     pa = _repeat_batch(base_pa[source_idx], context_dim)
     cf_pa = pa.copy()
-    cf_pa[0, 0] = base_pa[target_idx, 0]
-    cf_pa[1, 1] = base_pa[target_idx, 1]
+    cf_pa = cf_pa.at[0, 0].set(base_pa[target_idx, 0])
+    cf_pa = cf_pa.at[1, 1].set(base_pa[target_idx, 1])
     cf_pa = cf_pa.at[2:, 2:].set(jnp.eye(10, dtype=cf_pa.dtype))
     pa = jnp.repeat(jnp.repeat(pa[:, None, None, :], input_res, axis=1), input_res, axis=2)
     cf_pa = jnp.repeat(jnp.repeat(cf_pa[:, None, None, :], input_res, axis=1), input_res, axis=2)

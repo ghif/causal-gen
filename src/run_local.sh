@@ -32,7 +32,7 @@ if [ "$run_smoke" = true ]
 then
   extra_args+=(
     --epochs=1
-    --viz_freq=0
+    --viz_freq=1
     --checkpoint_smoke_test
     --checkpoint_smoke_steps=1
     --eval_freq=1000000
