@@ -453,15 +453,23 @@ def batch_iterator(dataset, batch_size: int, shuffle: bool, seed: int) -> Iterat
 
 def write_images(args, model, params, batch, rng_key=None, step: Optional[int] = None):
     viz_batch_size = int(getattr(args, "viz_batch_size", getattr(args, "viz_bs", 32)))
-    x = _ensure_nhwc(np.asarray(batch["x"]))
+    x = np.asarray(batch["x"], dtype=np.float32)
+    if x.max() > 1.5:
+        x = (x - 127.5) / 127.5
+    pa = np.asarray(batch["pa"], dtype=np.float32)
+    if pa.ndim == 2:
+        pa = pa[:, :, None, None]
+        pa = np.repeat(pa, args.input_res, axis=2)
+        pa = np.repeat(pa, args.input_res, axis=3)
+    x = _ensure_nhwc(x)
     viz_batch_size = max(1, min(viz_batch_size, x.shape[0]))
-    batch = {k: v[:viz_batch_size] for k, v in batch.items()}
-    x = _ensure_nhwc(np.asarray(batch["x"]))
+    x = x[:viz_batch_size]
+    pa = pa[:viz_batch_size]
     model = materialize_nnx(model, params)
     bs = int(min(viz_batch_size, x.shape[0]))
     x = x[:bs]
-    x_jax = jnp.asarray(batch["x"])[:bs]
-    pa_jax = jnp.asarray(batch["pa"])[:bs]
+    x_jax = jnp.asarray(x)
+    pa_jax = jnp.asarray(pa)
     rows = [postprocess(x)]
 
     def _append_counterfactual_rows(zs, pa_ctx, cf_pa_ctx, x_ctx, alpha, t):
@@ -508,7 +516,7 @@ def write_images(args, model, params, batch, rng_key=None, step: Optional[int] =
         rows.append(postprocess(sample))
 
     if "morphomnist" in getattr(args, "hps", ""):
-        base_pa = np.asarray(batch["pa"])[:bs]
+        base_pa = np.asarray(pa)[:bs]
         if base_pa.ndim == 4:
             base_pa = base_pa[:, 0, 0, :]
         idx = np.arange(bs)
