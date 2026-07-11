@@ -16,7 +16,7 @@ import numpy as np
 import optax
 from flax import nnx
 
-from utils import AsyncCheckpointWriter, EMA, batch_iterator, ensure_dir, linear_warmup, load_checkpoint, materialize_nnx, save_checkpoint, write_images
+from utils import BackgroundArtifactWriter, EMA, batch_iterator, ensure_dir, linear_warmup, load_checkpoint, materialize_nnx, save_checkpoint
 
 
 def preprocess_batch(args, batch, expand_pa: bool = False):
@@ -140,7 +140,7 @@ def checkpoint_smoke_test(args, state: TrainState, tx, logger) -> None:
     logger.info("checkpoint_smoke_test=passed checkpoint_dir=%s step=%d", args.checkpoint_dir, state.step)
 
 
-def save_state(args, state: TrainState, tx, epoch, *, checkpoint_writer: AsyncCheckpointWriter | None = None, wait: bool = False):
+def save_state(args, state: TrainState, tx, epoch, *, artifact_writer: BackgroundArtifactWriter | None = None, wait: bool = False):
     ckpt = {
         "epoch": epoch,
         "step": state.step,
@@ -152,20 +152,21 @@ def save_state(args, state: TrainState, tx, epoch, *, checkpoint_writer: AsyncCh
     }
     path = args.checkpoint_dir
     metadata = {"epoch": epoch, "best_loss": float(state.best_loss)}
-    if checkpoint_writer is not None and not wait:
-        return checkpoint_writer.submit(
+    if artifact_writer is not None and not wait:
+        remote_save_dir = getattr(args, "remote_save_dir", "")
+        return artifact_writer.submit_checkpoint(
             ckpt,
             path,
             step=state.step,
             custom_metadata=metadata,
-            local_tree_dir=args.save_dir if hasattr(args, "remote_save_dir") else None,
-            remote_tree_dir=args.remote_save_dir if hasattr(args, "remote_save_dir") else None,
+            local_tree_dir=args.checkpoint_dir if remote_save_dir else None,
+            remote_tree_dir=os.path.join(remote_save_dir, "checkpoints") if remote_save_dir else None,
         )
     save_checkpoint(ckpt, path, step=state.step, custom_metadata=metadata)
-    if hasattr(args, "remote_save_dir"):
+    if getattr(args, "remote_save_dir", ""):
         from utils import sync_tree
 
-        sync_tree(args.save_dir, args.remote_save_dir)
+        sync_tree(args.checkpoint_dir, os.path.join(args.remote_save_dir, "checkpoints"))
     return path
 
 
@@ -178,7 +179,7 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
     train_step_fn = make_train_step(graphdef, tx, state.ema.decay)
     eval_step_fn = make_eval_step(graphdef)
     beta_warmup = linear_warmup(args.beta_warmup_steps) if getattr(args, "beta_warmup_steps", 0) > 0 else None
-    checkpoint_writer = AsyncCheckpointWriter()
+    artifact_writer = BackgroundArtifactWriter()
 
     try:
         for epoch in range(state.epoch, args.epochs):
@@ -245,7 +246,7 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
 
                 if getattr(args, "checkpoint_smoke_test", False):
                     if args.viz_freq:
-                        viz_path = write_images(
+                        viz_path = artifact_writer.submit_viz(
                             args,
                             graphdef,
                             state.ema.params,
@@ -255,7 +256,7 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
                         )
                         logger.info("viz_image=%s", viz_path)
                     if state.step >= max(1, args.checkpoint_smoke_steps):
-                        checkpoint_writer.flush()
+                        artifact_writer.flush()
                         checkpoint_smoke_test(args, state, tx, logger)
                         return
 
@@ -264,18 +265,18 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
             valid_out = eval_step_fn(state.ema.params, valid_batch, valid_beta, jax.random.PRNGKey(args.seed + epoch))
             if float(valid_out["elbo"]) < state.best_loss:
                 state.best_loss = float(valid_out["elbo"])
-                save_state(args, state, tx, epoch + 1, checkpoint_writer=checkpoint_writer)
+                save_state(args, state, tx, epoch + 1, artifact_writer=artifact_writer)
             if hasattr(writer, "add_scalar"):
                 writer.add_scalar("train/elbo", train_loss_sum / max(1, steps_per_epoch), epoch + 1)
                 writer.add_scalar("valid/elbo", float(valid_out["elbo"]), epoch + 1)
             if args.viz_freq and not getattr(args, "checkpoint_smoke_test", False) and (epoch + 1) % args.viz_freq == 0:
-                viz_path = write_images(
+                viz_path = artifact_writer.submit_viz(
                     args,
                     graphdef,
                     state.ema.params,
                     valid_batch,
                     jax.random.PRNGKey(args.seed + epoch),
-                    step=epoch + 1,
+                    step=state.step,
                 )
                 logger.info("viz_image=%s", viz_path)
             epoch_time = time.perf_counter() - t0
@@ -290,8 +291,8 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
                 epoch_sample_per_sec,
             )
             if getattr(args, "checkpoint_smoke_test", False) and state.step >= max(1, args.checkpoint_smoke_steps):
-                checkpoint_writer.flush()
+                artifact_writer.flush()
                 checkpoint_smoke_test(args, state, tx, logger)
                 return
     finally:
-        checkpoint_writer.close()
+        artifact_writer.close()

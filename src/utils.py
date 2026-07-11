@@ -8,6 +8,7 @@ import random
 import shutil
 import tempfile
 import threading
+import logging
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Iterable, Iterator, Optional, Sequence, Tuple
@@ -141,6 +142,10 @@ def materialize_nnx(graphdef, params):
     return nnx.merge(graphdef, nnx.State(params))
 
 
+def viz_path_for_step(save_dir: str, step: int) -> str:
+    return os.path.join(save_dir, f"viz-step-{int(step)}.png")
+
+
 def sync_file(local_path: str, remote_path: str) -> None:
     if not is_remote_path(remote_path) or local_path == remote_path:
         return
@@ -218,11 +223,11 @@ def _save_checkpoint_and_sync(
         sync_tree(local_tree_dir, remote_tree_dir)
 
 
-class AsyncCheckpointWriter:
-    """Serialize checkpoint saves on a background thread."""
+class BackgroundArtifactWriter:
+    """Serialize artifact saves on a single background thread."""
 
     def __init__(self):
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="checkpoint-writer")
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="artifact-writer")
         self._futures = []
         self._lock = threading.Lock()
         self._closed = False
@@ -235,7 +240,27 @@ class AsyncCheckpointWriter:
         atexit.register(self.close)
         self._close_registered = True
 
-    def submit(
+    def _submit_job(
+        self,
+        fn,
+        *args,
+        **kwargs,
+    ):
+        if self._closed:
+            raise RuntimeError("BackgroundArtifactWriter is closed.")
+        future = self._executor.submit(fn, *args, **kwargs)
+        future.add_done_callback(self._report_future)
+        with self._lock:
+            self._futures.append(future)
+        return future
+
+    def _report_future(self, future):
+        try:
+            future.result()
+        except Exception:
+            logging.exception("Background artifact job failed")
+
+    def submit_checkpoint(
         self,
         data: Dict[str, Any],
         path: str,
@@ -244,9 +269,7 @@ class AsyncCheckpointWriter:
         local_tree_dir: Optional[str] = None,
         remote_tree_dir: Optional[str] = None,
     ):
-        if self._closed:
-            raise RuntimeError("AsyncCheckpointWriter is closed.")
-        future = self._executor.submit(
+        self._submit_job(
             _save_checkpoint_and_sync,
             data,
             path,
@@ -255,9 +278,21 @@ class AsyncCheckpointWriter:
             local_tree_dir,
             remote_tree_dir,
         )
-        with self._lock:
-            self._futures.append(future)
-        return future
+        return path
+
+    def submit_viz(
+        self,
+        args,
+        model,
+        params,
+        batch,
+        rng_key=None,
+        step: Optional[int] = None,
+    ):
+        viz_step = int(step if step is not None else getattr(args, "iter", 0))
+        viz_path = viz_path_for_step(args.save_dir, viz_step)
+        self._submit_job(write_images, args, model, params, batch, rng_key, step)
+        return viz_path
 
     def flush(self):
         with self._lock:
@@ -275,6 +310,9 @@ class AsyncCheckpointWriter:
         finally:
             self._executor.shutdown(wait=True, cancel_futures=False)
             self._closed = True
+
+
+AsyncCheckpointWriter = BackgroundArtifactWriter
 
 
 def load_checkpoint(path: str, template: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -522,10 +560,10 @@ def write_images(args, model, params, batch, rng_key=None, step: Optional[int] =
 
     grid = make_image_grid(rows, n_rows=len(rows), n_cols=bs)
     viz_step = int(step if step is not None else getattr(args, "iter", 0))
-    viz_path = os.path.join(args.save_dir, f"viz-{viz_step}.png")
+    viz_path = viz_path_for_step(args.save_dir, viz_step)
     imageio.imwrite(viz_path, grid)
-    if hasattr(args, "remote_save_dir"):
-        sync_file(viz_path, os.path.join(args.remote_save_dir, f"viz-{viz_step}.png"))
+    if getattr(args, "remote_save_dir", ""):
+        sync_file(viz_path, viz_path_for_step(args.remote_save_dir, viz_step))
     return viz_path
 
 

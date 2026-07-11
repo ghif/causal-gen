@@ -18,7 +18,7 @@ from datasets import morphomnist
 from hps import add_arguments, setup_hparams
 from pgm.flow_pgm import MorphoMNISTPGM
 from trainer import preprocess_batch
-from utils import AsyncCheckpointWriter, SummaryWriter, checkpoint_root_dir, ensure_dir, materialize_nnx, seed_all
+from utils import BackgroundArtifactWriter, SummaryWriter, checkpoint_root_dir, ensure_dir, materialize_nnx, seed_all
 
 
 def setup_logging(args):
@@ -59,7 +59,7 @@ def main(args):
     params = nnx.state(model, nnx.Param).to_pure_dict()
     tx = optax.adamw(args.lr, weight_decay=args.wd)
     opt_state = tx.init(params)
-    checkpoint_writer = AsyncCheckpointWriter()
+    checkpoint_writer = BackgroundArtifactWriter()
 
     def loss_fn(p, batch):
         model_ = materialize_nnx(graphdef, p)
@@ -105,13 +105,13 @@ def main(args):
             mean_loss = float(jnp.mean(jnp.array([m["loss"] for m in losses])))
             writer.add_scalar("train/loss", mean_loss, epoch + 1)
             logger.info(f"epoch={epoch+1} loss={mean_loss:.4f}")
-            checkpoint_writer.submit(
+            checkpoint_writer.submit_checkpoint(
                 {"params": params, "opt_state": opt_state, "hparams": vars(args), "epoch": epoch + 1},
                 args.checkpoint_dir,
                 step=epoch + 1,
                 custom_metadata={"epoch": epoch + 1, "loss": mean_loss},
-                local_tree_dir=args.save_dir if args.remote_save_dir else None,
-                remote_tree_dir=args.remote_save_dir if args.remote_save_dir else None,
+                local_tree_dir=args.checkpoint_dir if args.remote_save_dir else None,
+                remote_tree_dir=os.path.join(args.remote_save_dir, "checkpoints") if args.remote_save_dir else None,
             )
     finally:
         checkpoint_writer.close()
