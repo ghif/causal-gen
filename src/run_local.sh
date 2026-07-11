@@ -55,8 +55,8 @@ run_cmd=(python -u main.py
   --wd=0.01
   --beta=1
   --cond_prior
-  --eval_freq=4
-  --viz_freq=1
+  --eval_freq=50
+  --viz_freq=50
   --viz_batch_size=32
   "${extra_args[@]}")
 
