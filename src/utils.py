@@ -62,8 +62,8 @@ def normalize(x, x_min=None, x_max=None, zero_one=False):
 
 def log_standardize(x):
     x = jnp.asarray(x, dtype=jnp.float32)
-    lx = jnp.log(jnp.clip(x, a_min=1e-12))
-    return (lx - jnp.mean(lx)) / jnp.clip(jnp.std(lx), a_min=1e-12)
+    lx = jnp.log(jnp.maximum(x, 1e-12))
+    return (lx - jnp.mean(lx)) / jnp.maximum(jnp.std(lx), 1e-12)
 
 
 def linear_warmup(warmup_iters):

@@ -511,13 +511,13 @@ class DGaussNet(nnx.Module):
         cdf_plus = self.approx_cdf(plus_in)
         min_in = inv_stdv * (centered_x - 1.0 / 255.0)
         cdf_min = self.approx_cdf(min_in)
-        log_cdf_plus = jnp.log(jnp.clip(cdf_plus, a_min=1e-12))
-        log_one_minus_cdf_min = jnp.log(jnp.clip(1.0 - cdf_min, a_min=1e-12))
+        log_cdf_plus = jnp.log(jnp.maximum(cdf_plus, 1e-12))
+        log_one_minus_cdf_min = jnp.log(jnp.maximum(1.0 - cdf_min, 1e-12))
         cdf_delta = cdf_plus - cdf_min
         log_probs = jnp.where(
             x < -0.999,
             log_cdf_plus,
-            jnp.where(x > 0.999, log_one_minus_cdf_min, jnp.log(jnp.clip(cdf_delta, a_min=1e-12))),
+            jnp.where(x > 0.999, log_one_minus_cdf_min, jnp.log(jnp.maximum(cdf_delta, 1e-12))),
         )
         return -jnp.mean(log_probs, axis=(1, 2, 3))
 
