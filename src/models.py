@@ -390,6 +390,14 @@ class Decoder(nnx.Module):
     def __call__(self, parents, x=None, t=None, abduct=False, latents=None, rng=None, training=False):
         if rng is None:
             rng = jax.random.PRNGKey(0)
+        # Training transfers compact context vectors and expands them on device.
+        # Keep accepting the historical spatial representation for sampling and
+        # checkpoint compatibility.
+        if parents.ndim == 2:
+            parents = jnp.broadcast_to(
+                parents[:, None, None, :],
+                (parents.shape[0], self.resolutions[-1], self.resolutions[-1], parents.shape[-1]),
+            )
         bias = {}
         for i, res in enumerate(self.resolutions):
             if res <= self.bias_max_res:

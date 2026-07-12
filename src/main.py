@@ -43,10 +43,13 @@ def main(args):
     ensure_dir(args.checkpoint_dir)
     logger = setup_logging(args)
     logger.info(
-        "runtime accelerator=%s backend=%s local_device_count=%d",
+        "runtime accelerator=%s backend=%s local_device_count=%d jax=%s global_batch_size=%d lr=%g",
         args.accelerator,
         jax.default_backend(),
         jax.local_device_count(),
+        jax.__version__,
+        args.bs,
+        args.lr,
     )
     logger.info("loading datasets")
     writer = setup_tensorboard(args)
