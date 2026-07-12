@@ -16,7 +16,7 @@ import numpy as np
 import optax
 from flax import nnx
 
-from utils import BackgroundArtifactWriter, EMA, batch_iterator, ensure_dir, linear_warmup, load_checkpoint, materialize_nnx, save_checkpoint, write_images
+from utils import BackgroundArtifactWriter, EMA, append_text_file, batch_iterator, ensure_dir, linear_warmup, load_checkpoint, materialize_nnx, save_checkpoint, write_images
 
 
 def preprocess_batch(args, batch, expand_pa: bool = False):
@@ -463,6 +463,21 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
                     epoch_iter_per_sec,
                     epoch_sample_per_sec,
                     extra={"eval_log": True},
+                )
+                trainlog_lines = [
+                    f"epoch={epoch + 1} train nelbo={train_stats_sum['elbo'] / max(1, steps_per_epoch):.4f} "
+                    f"nll={train_stats_sum['nll'] / max(1, steps_per_epoch):.4f} "
+                    f"kl={train_stats_sum['kl'] / max(1, steps_per_epoch):.4f} "
+                    f"steps={state.step} it_s={epoch_iter_per_sec:.3f} sample_s={epoch_sample_per_sec:.3f}",
+                    f"epoch={epoch + 1} valid nelbo={valid_nelbo:.4f} nll={valid_nll:.4f} kl={valid_kl:.4f} steps={state.step}",
+                    f"epoch={epoch + 1} epoch_time={epoch_time:.1f}s epoch_iter_s={epoch_iter_per_sec:.3f} epoch_sample_s={epoch_sample_per_sec:.3f}",
+                ]
+                trainlog_lines.insert(0, f"viz_image={viz_path}")
+                remote_trainlog = os.path.join(args.remote_save_dir, "trainlog.txt") if getattr(args, "remote_save_dir", "") else None
+                append_text_file(
+                    os.path.join(args.save_dir, "trainlog.txt"),
+                    "\n".join(trainlog_lines) + "\n",
+                    remote_path=remote_trainlog,
                 )
             else:
                 logger.info(

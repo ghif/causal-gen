@@ -29,9 +29,13 @@ BibTeX:
 
 ### Example Results
 
-The JAX port follows the same high-level goal as the Torch repository: train a causal image model, abduce latent noise from observations, and generate counterfactual images under interventions.
+The JAX port follows the same high-level goal as the Torch repository, but the MorphoMNIST workflow is best understood as a **three-stage causal pipeline**:
 
-Current development focus is **MorphoMNIST on Mac CPU**, which is the primary acceptance path for the port.
+1. learn the structured causal variables for the dataset
+2. train the image model conditioned on those variables
+3. combine both pieces to generate counterfactual images under interventions
+
+Current development focus is **MorphoMNIST on Mac CPU**, which is the primary acceptance path for the port and the clearest end-to-end example of that pipeline.
 
 ### Project Structure
 
@@ -61,11 +65,17 @@ Current development focus is **MorphoMNIST on Mac CPU**, which is the primary ac
 
 ### Overview
 
-The original repository used Pyro for the structured causal mechanisms and PyTorch for the image mechanism. This port replaces that stack with a **pure JAX** implementation:
+The original repository used Pyro for the structured causal mechanisms and PyTorch for the image mechanism. This port replaces that stack with a **pure JAX** implementation, but it preserves the same causal workflow:
 
-1. JAX / Flax / Optax are used for the image mechanism and training loop.
-2. The structured-variable side is implemented in JAX for the MorphoMNIST path first.
-3. Counterfactual generation keeps the same overall semantics: abduct latent factors from an observation, apply an intervention, then decode a counterfactual image.
+1. Train the structured variables first.
+2. Train the image model conditioned on those variables.
+3. Reuse both trained pieces for abduction and counterfactual generation.
+
+In other words, the image model is only one stage in the pipeline. The full MorphoMNIST story is:
+
+- parent variables such as digit, thickness, and intensity are learned as causal mechanisms
+- the image `x` is then modeled conditional on those parents
+- counterfactual images are produced by keeping abducted latent factors fixed while intervening on the parents
 
 The current port is intentionally CPU-first and keeps the model and artifact layout close to the Torch version so it is easy to compare runs.
 
@@ -116,6 +126,27 @@ The training code reads MorphoMNIST directly from that bucket. If you want to po
 The structured-variable and counterfactual code paths are currently centered on MorphoMNIST. The broader UK Biobank and MIMIC-CXR functionality from the Torch repository is preserved as a porting target, but MorphoMNIST is the best-supported path right now.
 
 ### Run
+
+For MorphoMNIST, the recommended training order is:
+
+1. train the parent SCM
+2. train the image mechanism
+3. run counterfactual composition / evaluation
+
+The scripts below match that order.
+
+#### 1. Train the parent SCM
+
+Run the structured-variable model first:
+
+```bash
+cd causal-genx/src
+python pgm/train_pgm.py --hps morphomnist --exp_name morphomnist_pgm
+```
+
+This learns the causal variables for MorphoMNIST, namely digit, thickness, and intensity.
+
+#### 2. Train the image mechanism
 
 To launch local CPU training of the JAX image mechanism, run the launcher from inside `src/`:
 
@@ -174,7 +205,27 @@ cd causal-genx/src
 python main.py --exp_name my_experiment --data_dir gs://medical-airnd/causal-gen/datasets/morphomnist
 ```
 
+#### 3. Run counterfactual composition
+
+After both checkpoints exist, run:
+
+```bash
+cd causal-genx/src
+python pgm/train_cf.py --hps morphomnist --exp_name morphomnist_cf
+```
+
+Point `--pgm_path` and `--vae_path` at the parent-SCM and image-model checkpoint roots you want to combine. This script does not train a new model from scratch; it loads the two trained pieces and performs counterfactual abduction + intervention.
+
 For counterfactual or structured-mechanism training, the matching JAX entrypoints live under `src/pgm/`.
+
+`run_gpu.sh` is the GPU launcher for the `main.py` image-model training job. It is triggered when you explicitly run it from the shell, for example:
+
+```bash
+cd causal-genx/src
+bash run_gpu.sh my_experiment
+```
+
+It is not called automatically by `main.py`, `train_pgm.py`, or `train_cf.py`.
 
 ### Current Defaults
 
@@ -190,7 +241,7 @@ For counterfactual or structured-mechanism training, the matching JAX entrypoint
 
 - This port intentionally keeps the Torch repository as the behavioral reference.
 - MorphoMNIST is the main acceptance gate for output parity and smooth CPU execution.
-- The JAX code is structured to preserve the same training and counterfactual workflow shape as the original repository, even though the implementation stack is different.
+- The JAX code is structured to preserve the same causal workflow shape as the original repository: parent SCM first, image model second, counterfactual composition last.
 
 ### Extending the Port
 
@@ -199,7 +250,9 @@ If you want to add a new dataset or causal mechanism, the rough flow is:
 1. Add the dataset loader in `src/datasets.py`.
 2. Add or extend the causal model in `src/pgm/flow_pgm.py`.
 3. Adjust hyperparameters and defaults in `src/hps.py`.
-4. Train the image mechanism with `src/main.py` and the SCM / counterfactual paths with `src/pgm/train_pgm.py` and `src/pgm/train_cf.py`.
+4. Train the parent SCM with `src/pgm/train_pgm.py`.
+5. Train the image mechanism with `src/main.py`.
+6. Use `src/pgm/train_cf.py` to compose the trained pieces for counterfactual evaluation.
 
 ### Checkpointing
 

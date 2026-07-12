@@ -18,7 +18,7 @@ from datasets import morphomnist
 from hps import add_arguments, setup_hparams
 from pgm.flow_pgm import MorphoMNISTPGM
 from trainer import preprocess_batch
-from utils import BackgroundArtifactWriter, SummaryWriter, SyncFileHandler, EvalOnlyFileFilter, checkpoint_root_dir, ensure_dir, experiment_run_dir, materialize_nnx, seed_all
+from utils import BackgroundArtifactWriter, SummaryWriter, SyncFileHandler, EvalOnlyFileFilter, checkpoint_root_dir, ensure_dir, experiment_run_dir, materialize_nnx, seed_all, sync_file
 
 
 def setup_logging(args):
@@ -116,6 +116,8 @@ def main(args):
                 local_tree_dir=args.checkpoint_dir if remote_run_dir else None,
                 remote_tree_dir=os.path.join(remote_run_dir, "checkpoints") if remote_run_dir else None,
             )
+            if remote_run_dir:
+                sync_file(os.path.join(args.save_dir, "trainlog.txt"), os.path.join(remote_run_dir, "trainlog.txt"))
     finally:
         checkpoint_writer.close()
     writer.close()

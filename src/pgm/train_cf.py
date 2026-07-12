@@ -18,7 +18,7 @@ from pgm.dscm import DSCM
 from pgm.flow_pgm import MorphoMNISTPGM
 from models import HVAE
 from trainer import preprocess_batch
-from utils import EvalOnlyFileFilter, SummaryWriter, SyncFileHandler, ensure_dir, load_checkpoint, seed_all
+from utils import EvalOnlyFileFilter, SummaryWriter, SyncFileHandler, ensure_dir, load_checkpoint, seed_all, sync_file
 
 
 def setup_logging(args):
@@ -43,6 +43,7 @@ class Bundle:
 def main(args):
     seed_all(args.seed, args.deterministic)
     args.save_dir = os.path.join(args.ckpt_dir, args.hps, args.exp_name or "cf")
+    args.remote_save_dir = os.path.join(args.remote_ckpt_dir, args.hps, args.exp_name or "cf")
     ensure_dir(args.save_dir)
     logger = setup_logging(args)
     writer = SummaryWriter(args.save_dir)
@@ -80,6 +81,8 @@ def main(args):
     cf = dscm.counterfactual(obs, intervention, rng=jax.random.PRNGKey(args.seed))
     logger.info(f"counterfactual_x_shape={cf['x'].shape}")
     writer.add_scalar("cf/x_mean", float(jnp.mean(cf["x"])), 1)
+    if getattr(args, "remote_save_dir", ""):
+        sync_file(os.path.join(args.save_dir, "trainlog.txt"), os.path.join(args.remote_save_dir, "trainlog.txt"))
     writer.close()
 
 

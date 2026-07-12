@@ -28,6 +28,9 @@ class EvalOnlyFileFilter(logging.Filter):
 
 
 class SyncFileHandler(logging.FileHandler):
+    def __init__(self, filename: str, mode: str = "a", encoding: str | None = None, delay: bool = False):
+        super().__init__(filename, mode=mode, encoding=encoding, delay=delay)
+
     def emit(self, record: logging.LogRecord) -> None:
         super().emit(record)
         if self.stream is not None and not self.stream.closed:
@@ -36,6 +39,21 @@ class SyncFileHandler(logging.FileHandler):
                 os.fsync(self.stream.fileno())
             except OSError:
                 pass
+
+
+def append_text_file(local_path: str, text: str, remote_path: str | None = None) -> None:
+    ensure_parent_dir(local_path)
+    with open(local_path, "a", encoding="utf-8") as f:
+        f.write(text)
+        if text and not text.endswith("\n"):
+            f.write("\n")
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass
+    if remote_path:
+        sync_file(local_path, remote_path)
 
 class _NoOpMonitoring:
     def record_scalar(self, *args, **kwargs):
