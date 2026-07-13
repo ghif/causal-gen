@@ -1,147 +1,153 @@
-from __future__ import annotations
-
 import argparse
-import os
+import gc
 import logging
+import os
+import traceback
 
-from runtime import configure_backend_from_argv
+import send2trash
+import torch
 
-configure_backend_from_argv()
-
-import jax
-from flax import nnx
-
-from datasets import morphomnist
-from hps import add_arguments, setup_hparams
-from models import HVAE, SimpleVAE
-from trainer import init_state, trainer
-from utils import SummaryWriter, checkpoint_root_dir, ensure_dir, experiment_run_dir, load_checkpoint, seed_all
-
-
-def setup_logging(args):
-    ensure_dir(args.save_dir)
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(message)s",
-        handlers=[logging.StreamHandler()],
-        force=True,
-    )
-    return logging.getLogger("causal-genx")
+from hps import Hparams
+from simple_vae import VAE
+from train_setup import (
+    derive_save_directories,
+    setup_dataloaders,
+    setup_directories,
+    setup_logging,
+    setup_optimizer,
+    setup_tensorboard,
+)
+from trainer import trainer
+from utils import EMA, open_file, path_exists, seed_all, select_device, sync_tree
+from vae import HVAE
+from xla_runtime import NullWriter, is_master, is_xla_device, launch, rank, rendezvous
 
 
-def setup_tensorboard(args):
-    return SummaryWriter(args.save_dir)
-
-
-def main(args):
+def main(args: Hparams):
     seed_all(args.seed, args.deterministic)
-    if (
-        getattr(args, "tpu_auto_scale", False)
-        and args.accelerator == "tpu"
-        and jax.local_device_count() > 1
-    ):
-        # Preserve explicit non-default overrides supplied after run_tpu.sh's
-        # batch/lr defaults.
-        if args.bs == 128:
-            args.bs = 512
-        # AdamW LR scaling is not generally safe for this hierarchical VAE.
-        # Keep the configured learning rate even when scaling the global batch.
-        args.drop_remainder = True
-    args.save_dir = experiment_run_dir(args.ckpt_dir, args.hps, args.exp_name, "run")
-    args.checkpoint_dir = checkpoint_root_dir(args.save_dir)
-    remote_run_dir = experiment_run_dir(args.remote_ckpt_dir, args.hps, args.exp_name, "run")
-    args.remote_save_dir = remote_run_dir
-    ensure_dir(args.save_dir)
-    ensure_dir(args.checkpoint_dir)
-    logger = setup_logging(args)
-    logger.info(
-        "runtime accelerator=%s backend=%s local_device_count=%d jax=%s global_batch_size=%d lr=%g",
-        args.accelerator,
-        jax.default_backend(),
-        jax.local_device_count(),
-        jax.__version__,
-        args.bs,
-        args.lr,
-    )
-    logger.info("loading datasets")
-    writer = setup_tensorboard(args)
-    datasets = morphomnist(args)
-    logger.info("datasets loaded")
-    rngs = nnx.Rngs(args.seed)
-    logger.info("building model")
-    model = HVAE(
-        input_channels=args.input_channels,
-        input_res=args.input_res,
-        enc_arch=args.enc_arch,
-        dec_arch=args.dec_arch,
-        widths=args.widths,
-        z_dim=args.z_dim,
-        context_dim=args.context_dim,
-        z_max_res=args.z_max_res,
-        bottleneck=args.bottleneck,
-        cond_prior=args.cond_prior,
-        q_correction=args.q_correction,
-        bias_max_res=args.bias_max_res,
-        x_like=args.x_like,
-        kl_free_bits=args.kl_free_bits,
-        std_init=args.std_init,
-        hps=args.hps,
-        rngs=rngs,
-    ) if args.vae == "hierarchical" else SimpleVAE(
-        input_channels=args.input_channels,
-        input_res=args.input_res,
-        enc_arch=args.enc_arch,
-        dec_arch=args.dec_arch,
-        widths=args.widths,
-        z_dim=args.z_dim,
-        context_dim=args.context_dim,
-        z_max_res=args.z_max_res,
-        bottleneck=args.bottleneck,
-        cond_prior=args.cond_prior,
-        q_correction=args.q_correction,
-        bias_max_res=args.bias_max_res,
-        x_like=args.x_like,
-        kl_free_bits=args.kl_free_bits,
-        std_init=args.std_init,
-        hps=args.hps,
-        rngs=rngs,
-    )
-    logger.info("model built")
-    graphdef, _ = nnx.split(model, nnx.Param)
-    logger.info("initialized model graph")
-    sample = datasets["train"][0]
-    from trainer import preprocess_batch
+    # update hyperparams if resuming from a checkpoint
+    ckpt = None
+    if args.resume:
+        if path_exists(args.resume):
+            print(f"\nLoading checkpoint: {args.resume}")
+            with open_file(args.resume, "rb") as f:
+                ckpt = torch.load(f, map_location="cpu")
+            ckpt_args = {
+                k: v
+                for k, v in ckpt["hparams"].items()
+                if k not in {"resume", "accelerator", "device"}
+            }
+            if args.data_dir is not None:
+                ckpt_args["data_dir"] = args.data_dir
+            if args.lr < ckpt_args["lr"]:
+                ckpt_args["lr"] = args.lr
+            vars(args).update(ckpt_args)
+        else:
+            print(f"Checkpoint not found at: {args.resume}")
 
-    sample = preprocess_batch(args, {k: sample[k][None] for k in sample}, expand_pa=True)
-    rng = __import__("jax").random.PRNGKey(args.seed)
-    logger.info("initializing optimizer state")
-    state, tx = init_state(model, args, sample, rng)
-    logger.info("optimizer state initialized")
-    if args.resume and os.path.exists(args.resume):
-        logger.info("restoring checkpoint from %s", args.resume)
-        template = {
-            "epoch": state.epoch,
-            "step": state.step,
-            "best_loss": state.best_loss,
-            "params": state.params,
-            "ema_params": state.ema.params,
-            "opt_state": state.opt_state,
-        }
-        ckpt = load_checkpoint(args.resume, template=template)
-        state.params = ckpt["params"]
-        state.ema.params = ckpt["ema_params"]
-        state.opt_state = ckpt["opt_state"]
-        state.step = ckpt["step"]
-        state.epoch = ckpt["epoch"]
-        state.best_loss = ckpt["best_loss"]
-        logger.info("checkpoint restored")
-    logger.info("starting training loop")
-    trainer(args, graphdef, state, tx, datasets, writer, logger)
-    writer.close()
+    args.device = select_device(args.accelerator)
+
+    # load data
+    dataloaders = setup_dataloaders(args)
+
+    # init model
+    if args.vae == "hierarchical":
+        model = HVAE(args)
+    elif args.vae == "simple":
+        model = VAE(args)
+    else:
+        NotImplementedError
+
+    def init_bias(m):
+        if type(m) == torch.nn.Conv2d:
+            torch.nn.init.zeros_(m.bias)
+
+    model.apply(init_bias)
+    ema = EMA(model, beta=args.ema_rate)
+    ema.ema_model.eval()
+
+    # setup model save directory, logging and tensorboard summaries
+    assert args.exp_name != "", "No experiment name given."
+    master = not is_xla_device(args.device) or is_master()
+    if master:
+        args.save_dir = setup_directories(args, ckpt_dir=args.ckpt_dir)
+    else:
+        args.save_dir = derive_save_directories(args, args.ckpt_dir)
+    if is_xla_device(args.device):
+        rendezvous("experiment-directories-ready")
+    writer = setup_tensorboard(args, model) if master else NullWriter()
+    logger = setup_logging(args) if master else logging.getLogger("tpu-worker")
+
+    # setup optimizer
+    optimizer, scheduler = setup_optimizer(args, model)
+
+    if args.device.type == "cuda":
+        torch.cuda.set_device(args.device)
+    model.to(args.device)
+    ema.to(args.device)
+    if is_xla_device(args.device):
+        seed_all(args.seed + rank(), args.deterministic)
+
+    # load checkpoint state dicts
+    if ckpt is not None:
+        model.load_state_dict(ckpt["model_state_dict"])
+        ema.ema_model.load_state_dict(ckpt["ema_model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if torch.is_tensor(v):
+                    state[k] = v.to(args.device)
+        # scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+        # update lr of the loaded optimizer
+        for p_group in optimizer.param_groups:
+            p_group["lr"] = args.lr
+            p_group["initial_lr"] = args.lr  # needed to init the scheduler lr
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer, lr_lambda=lambda x: x * 0 + 1
+        )
+        args.start_epoch, args.iter = ckpt["epoch"], ckpt["step"]
+        args.best_loss = ckpt["best_loss"]
+        del ckpt  # remove reference to checkpoint
+    else:
+        args.start_epoch, args.iter, args.best_loss = 0, 0, float("inf")
+
+    # train
+    try:
+        gc.collect()
+        if args.device.type == "cuda":
+            torch.cuda.empty_cache()
+        trainer(args, model, ema, dataloaders, optimizer, scheduler, writer, logger)
+    except KeyboardInterrupt:
+        print(traceback.format_exc())
+        if master and input("Training interrupted, keep logs? [Y/n]: ") == "n":
+            if input(f"Send '{args.save_dir}' to Trash? [y/N]: ") == "y":
+                send2trash.send2trash(args.save_dir)
+                print("Done.")
+    finally:
+        writer.flush()
+        writer.close()
+        logging.shutdown()
+        if master and hasattr(args, "remote_save_dir"):
+            sync_tree(args.save_dir, args.remote_save_dir)
+
+
+def _tpu_worker(_ordinal: int, args: Hparams):
+    main(args)
 
 
 if __name__ == "__main__":
+    from hps import add_arguments, setup_hparams
+
     parser = argparse.ArgumentParser()
     parser = add_arguments(parser)
     args = setup_hparams(parser)
-    main(args)
+    if os.environ.get("CAUSAL_GEN_XLA_WORKER") != "1" and (
+        args.accelerator == "tpu"
+        or (
+            args.accelerator == "auto"
+            and os.environ.get("PJRT_DEVICE", "").upper() == "TPU"
+        )
+    ):
+        launch(_tpu_worker, args=(args,))
+    else:
+        main(args)

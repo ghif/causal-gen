@@ -1,158 +1,307 @@
-from __future__ import annotations
-
 import argparse
-from dataclasses import dataclass
-from typing import Any, Dict
+
+HPARAMS_REGISTRY = {}
 
 
-@dataclass
 class Hparams:
-    def update(self, values: Dict[str, Any]):
-        for k, v in values.items():
+    def update(self, dict):
+        for k, v in dict.items():
             setattr(self, k, v)
 
 
-HPARAMS_REGISTRY: Dict[str, Hparams] = {}
+morphomnist = Hparams()
+morphomnist.lr = 1e-3
+morphomnist.bs = 32
+morphomnist.wd = 0.01
+morphomnist.z_dim = 16
+morphomnist.input_res = 32
+morphomnist.pad = 4
+morphomnist.enc_arch = "32b3d2,16b3d2,8b3d2,4b3d4,1b4"
+morphomnist.dec_arch = "1b4,4b4,8b4,16b4,32b4"
+morphomnist.widths = [16, 32, 64, 128, 256]
+morphomnist.parents_x = ["thickness", "intensity", "digit"]
+morphomnist.concat_pa = True
+morphomnist.context_norm = "[-1,1]"
+morphomnist.context_dim = 12
+morphomnist.data_dir = "gs://medical-airnd/causal-gen/datasets/morphomnist"
+HPARAMS_REGISTRY["morphomnist"] = morphomnist
 
 
-def _make_hparams(**kwargs) -> Hparams:
-    hp = Hparams()
-    for k, v in kwargs.items():
-        setattr(hp, k, v)
-    return hp
+cmnist = Hparams()
+cmnist.lr = 1e-3
+cmnist.bs = 32
+cmnist.wd = 0.01
+cmnist.z_dim = 16
+cmnist.input_res = 32
+cmnist.input_channels = 3
+cmnist.pad = 4
+cmnist.enc_arch = "32b3d2,16b3d2,8b3d2,4b3d4,1b4"
+cmnist.dec_arch = "1b4,4b4,8b4,16b4,32b4"
+cmnist.widths = [16, 32, 64, 128, 256]
+cmnist.parents_x = ["digit", "colour"]
+cmnist.context_dim = 20
+HPARAMS_REGISTRY["cmnist"] = cmnist
 
 
-HPARAMS_REGISTRY["morphomnist"] = _make_hparams(
-    accelerator="cpu",  # default backend for local development
-    precision="fp32",  # full precision for parity and stability
-    lr=1e-3,  # AdamW learning rate
-    bs=32,  # global batch size
-    wd=0.01,  # AdamW weight decay
-    z_dim=16,  # latent dimensionality
-    input_res=32,  # image resolution
-    input_channels=1,  # grayscale input channels
-    pad=4,  # random crop padding during training
-    enc_arch="32b3d2,16b3d2,8b3d2,4b3d4,1b4",  # encoder block layout
-    dec_arch="1b4,4b4,8b4,16b4,32b4",  # decoder block layout
-    widths=[16, 32, 64, 128, 256],  # channel widths per scale
-    bottleneck=4,  # bottleneck reduction factor inside blocks
-    parents_x=["thickness", "intensity", "digit"],  # parent variables concatenated to x
-    concat_pa=True,  # concatenate parents spatially to feature maps
-    context_norm="[-1,1]",  # normalize parent variables to [-1, 1]
-    context_dim=12,  # parent/context feature dimension
-    data_dir="gs://medical-airnd/causal-gen/datasets/morphomnist",  # MorphoMNIST dataset location
-    hps="morphomnist",  # hyperparameter preset name
-    vae="hierarchical",  # hierarchical VAE variant
-    x_like="diag_dgauss",  # diagonal discretized Gaussian likelihood
-    std_init=0.0,  # likelihood log-scale init; 0 keeps random conv init
-    q_correction=False,  # disable posterior correction path
-    beta=1.0,  # KL weight
-    kl_free_bits=0.0,  # free-bits threshold for KL
-    beta_warmup_steps=0,  # disable beta warmup in preset
-    grad_clip=350.0,  # global grad-norm clipping threshold
-    grad_skip=500.0,  # skip update if grad norm exceeds this
-    accu_steps=1,  # gradient accumulation steps
-    viz_batch_size=32,  # number of samples used for visualization
-    eval_freq=5,  # run validation and visualization every N epochs
-    checkpoint_freq=1,  # run checkpoint save eligibility every N epochs
-    seed=7,  # random seed
-    deterministic=False,  # allow nondeterministic execution
-    ema_rate=0.999,  # EMA decay for evaluation weights
-    exp_name="",  # experiment name
-    ckpt_dir="checkpoints",  # local checkpoint root
-    remote_ckpt_dir="gs://medical-airnd/causal-gen/checkpoints",  # mirrored checkpoint root
-    resume="",  # checkpoint root to resume from
-)
+ukbb64 = Hparams()
+ukbb64.lr = 1e-3
+ukbb64.bs = 32
+ukbb64.wd = 0.1
+ukbb64.z_dim = 16
+ukbb64.input_res = 64
+ukbb64.pad = 3
+ukbb64.enc_arch = "64b3d2,32b31d2,16b15d2,8b7d2,4b3d4,1b2"
+ukbb64.dec_arch = "1b2,4b4,8b8,16b16,32b32,64b4"
+ukbb64.widths = [32, 64, 128, 256, 512, 1024]
+HPARAMS_REGISTRY["ukbb64"] = ukbb64
 
 
-def add_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
-    parser.add_argument("--accelerator", type=str, default="cpu", choices=["cpu", "gpu", "tpu"])  # backend selector
-    parser.add_argument("--precision", type=str, default="fp32", choices=["fp32", "bf16"])  # numeric precision mode
-    parser.add_argument("--exp_name", type=str, default="")  # run name used for checkpoints and logs
-    parser.add_argument("--data_dir", type=str, default="gs://medical-airnd/causal-gen/datasets/morphomnist")  # dataset path
-    parser.add_argument("--ckpt_dir", type=str, default="checkpoints")  # local checkpoint output directory
-    parser.add_argument("--remote_ckpt_dir", type=str, default="gs://medical-airnd/causal-gen/checkpoints")  # remote mirror for checkpoints
-    parser.add_argument("--hps", type=str, default="morphomnist")  # preset name to load
-    parser.add_argument("--resume", type=str, default="")  # checkpoint directory to resume from
-    parser.add_argument("--seed", type=int, default=7)  # RNG seed
-    parser.add_argument("--deterministic", action="store_true", default=False)  # favor deterministic kernels when possible
-    parser.add_argument("--epochs", type=int, default=5000)  # total training epochs
-    parser.add_argument("--bs", type=int, default=32)  # global batch size
-    parser.add_argument("--num_workers", type=int, default=0)  # dataloader worker count
-    parser.add_argument("--pin_memory", type=str, default="false")  # pin host memory for data loading
-    parser.add_argument("--persistent_workers", type=str, default="false")  # keep dataloader workers alive
-    parser.add_argument("--prefetch_factor", type=int, default=-1)  # dataloader prefetch depth
-    parser.add_argument("--lr", type=float, default=1e-3)  # optimizer learning rate
-    parser.add_argument("--lr_warmup_steps", type=int, default=100)  # warmup duration for learning rate
-    parser.add_argument("--wd", type=float, default=0.01)  # optimizer weight decay
-    parser.add_argument("--betas", nargs="+", type=float, default=[0.9, 0.9])  # AdamW beta1 and beta2
-    parser.add_argument("--ema_rate", type=float, default=0.999)  # EMA decay for eval weights
-    parser.add_argument("--input_res", type=int, default=32)  # input image resolution
-    parser.add_argument("--input_channels", type=int, default=1)  # number of image channels
-    parser.add_argument("--pad", type=int, default=4)  # training crop padding
-    parser.add_argument("--hflip", type=float, default=0.5)  # horizontal flip probability
-    parser.add_argument("--grad_clip", type=float, default=350.0)  # gradient clipping threshold
-    parser.add_argument("--grad_skip", type=float, default=500.0)  # skip updates above this grad norm
-    parser.add_argument("--accu_steps", type=int, default=1)  # gradient accumulation steps
-    parser.add_argument("--beta", type=float, default=1.0)  # KL multiplier
-    parser.add_argument("--beta_warmup_steps", type=int, default=0)  # beta warmup duration
-    parser.add_argument("--kl_free_bits", type=float, default=0.0)  # free-bits threshold for KL
-    parser.add_argument(
-        "--viz_batch_size",
-        type=int,
-        default=32,
-        help="samples used for visual grids",
-    )
-    parser.add_argument(
-        "--viz_bs",
-        type=int,
-        dest="viz_batch_size",
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument("--speed_log_freq", type=int, default=50)  # step logging frequency
-    parser.add_argument(
-        "--execution_mode",
-        choices=["auto", "single_device", "replicated"],
-        default="auto",
-        help="auto uses replicated training only for multi-core TPU",
-    )
-    parser.add_argument("--drop_remainder", action="store_true", default=False)
-    parser.add_argument("--benchmark_steps", type=int, default=0, help="stop after this many training steps; 0 disables")
-    parser.add_argument("--benchmark_warmup_steps", type=int, default=20)
-    parser.add_argument(
-        "--tpu_auto_scale",
-        action="store_true",
-        default=False,
-        help="scale the default batch and learning rate when this process sees a multi-core TPU",
-    )
-    parser.add_argument("--eval_freq", type=int, default=5)  # validation and visualization frequency in epochs
-    parser.add_argument("--checkpoint_freq", type=int, default=1)  # checkpoint eligibility frequency in epochs
-    parser.add_argument("--checkpoint_smoke_test", action="store_true", default=False)  # enable checkpoint smoke test
-    parser.add_argument("--checkpoint_smoke_steps", type=int, default=1)  # smoke-test step threshold
-    parser.add_argument("--vae", type=str, default="hierarchical", choices=["simple", "hierarchical"])  # VAE variant
-    parser.add_argument("--enc_arch", type=str, default="32b3d2,16b3d2,8b3d2,4b3d4,1b4")  # encoder architecture spec
-    parser.add_argument("--dec_arch", type=str, default="1b4,4b4,8b4,16b4,32b4")  # decoder architecture spec
-    parser.add_argument("--cond_prior", action="store_true", default=False)  # use conditional prior
-    parser.add_argument("--widths", nargs="+", type=int, default=[16, 32, 64, 128, 256])  # channel widths by scale
-    parser.add_argument("--bottleneck", type=int, default=4)  # block bottleneck divisor
-    parser.add_argument("--z_dim", type=int, default=16)  # latent dimension
-    parser.add_argument("--z_max_res", type=int, default=192)  # max resolution with stochastic latents
-    parser.add_argument("--bias_max_res", type=int, default=64)  # max resolution with learned bias maps
-    parser.add_argument("--context_dim", type=int, default=12)  # parent/context feature dimension
-    parser.add_argument("--context_norm", type=str, default="[-1,1]")  # parent normalization range
-    parser.add_argument("--parents_x", nargs="+", default=["thickness", "intensity", "digit"])  # parent variables
-    parser.add_argument("--concat_pa", action="store_true", default=True)  # concatenate parent maps to activations
-    parser.add_argument("--x_like", type=str, default="diag_dgauss")  # image likelihood type
-    parser.add_argument("--std_init", type=float, default=0.0)  # likelihood std init
-    parser.add_argument("--q_correction", action="store_true", default=False)  # enable posterior correction
-    parser.add_argument("--dataset", type=str, default="morphomnist")  # dataset identifier
-    return parser
+ukbb192 = Hparams()
+ukbb192.update(ukbb64.__dict__)
+ukbb192.input_res = 192
+ukbb192.pad = 9
+ukbb192.enc_arch = "192b1d2,96b3d2,48b7d2,24b11d2,12b7d2,6b3d6,1b2"
+ukbb192.dec_arch = "1b2,6b4,12b8,24b12,48b8,96b4,192b2"
+ukbb192.widths = [32, 64, 96, 128, 160, 192, 512]
+HPARAMS_REGISTRY["ukbb192"] = ukbb192
+
+
+mimic192 = Hparams()
+mimic192.lr = 1e-3
+mimic192.bs = 16
+mimic192.wd = 0.1
+mimic192.z_dim = 16
+mimic192.input_res = 192
+mimic192.pad = 9
+mimic192.enc_arch = "192b1d2,96b3d2,48b7d2,24b11d2,12b7d2,6b3d6,1b2"
+mimic192.dec_arch = "1b2,6b4,12b8,24b12,48b8,96b4,192b2"
+mimic192.widths = [32, 64, 96, 128, 160, 192, 512]
+HPARAMS_REGISTRY["mimic192"] = mimic192
 
 
 def setup_hparams(parser: argparse.ArgumentParser) -> Hparams:
+    hparams = Hparams()
     args = parser.parse_known_args()[0]
-    hp = Hparams()
-    preset = HPARAMS_REGISTRY.get(args.hps, HPARAMS_REGISTRY["morphomnist"])
-    hp.update(preset.__dict__)
-    hp.update(vars(args))
-    return hp
+    valid_args = set(args.__dict__.keys())
+    hparams_dict = HPARAMS_REGISTRY[args.hps].__dict__
+    for k in hparams_dict.keys():
+        if k not in valid_args:
+            raise ValueError(f"{k} not in default args")
+    parser.set_defaults(**hparams_dict)
+    hparams.update(parser.parse_known_args()[0].__dict__)
+    return hparams
+
+
+def add_arguments(parser: argparse.ArgumentParser):
+    parser.add_argument(
+        "--accelerator",
+        help="Training accelerator.",
+        type=str,
+        default="auto",
+        choices=["auto", "cpu", "cuda", "mps", "tpu"],
+    )
+    parser.add_argument(
+        "--precision",
+        help="Compute precision. auto selects bf16 on TPU and fp32 elsewhere.",
+        type=str,
+        default="auto",
+        choices=["auto", "fp32", "bf16"],
+    )
+    parser.add_argument("--exp_name", help="Experiment name.", type=str, default="")
+    parser.add_argument(
+        "--data_dir", help="Data directory to load form.", type=str, default=""
+    )
+    parser.add_argument(
+        "--ckpt_dir",
+        help="Directory to store checkpoints.",
+        type=str,
+        default="gs://medical-airnd/causal-gen/checkpoints",
+    )
+    parser.add_argument("--hps", help="hyperparam set.", type=str, default="ukbb64")
+    parser.add_argument(
+        "--resume", help="Path to load checkpoint.", type=str, default=""
+    )
+    parser.add_argument("--seed", help="Set random seed.", type=int, default=7)
+    parser.add_argument(
+        "--deterministic",
+        help="Toggle cudNN determinism.",
+        action="store_true",
+        default=False,
+    )
+    # training
+    parser.add_argument("--epochs", help="Training epochs.", type=int, default=5000)
+    parser.add_argument("--bs", help="Batch size.", type=int, default=32)
+    parser.add_argument(
+        "--num_workers",
+        help="DataLoader workers; use -1 for an accelerator-aware default.",
+        type=int,
+        default=-1,
+    )
+    parser.add_argument(
+        "--pin_memory",
+        help="Pin host memory for faster device transfers: auto/true/false.",
+        type=str,
+        default="auto",
+        choices=["auto", "true", "false"],
+    )
+    parser.add_argument(
+        "--persistent_workers",
+        help="Keep DataLoader workers alive across epochs: auto/true/false.",
+        type=str,
+        default="auto",
+        choices=["auto", "true", "false"],
+    )
+    parser.add_argument(
+        "--prefetch_factor",
+        help="DataLoader prefetch factor; use -1 for an accelerator-aware default.",
+        type=int,
+        default=-1,
+    )
+    parser.add_argument("--lr", help="Learning rate.", type=float, default=1e-3)
+    parser.add_argument(
+        "--lr_warmup_steps", help="lr warmup steps.", type=int, default=100
+    )
+    parser.add_argument("--wd", help="Weight decay penalty.", type=float, default=0.01)
+    parser.add_argument(
+        "--betas",
+        help="Adam beta parameters.",
+        nargs="+",
+        type=float,
+        default=[0.9, 0.9],
+    )
+    parser.add_argument(
+        "--ema_rate", help="Exp. moving avg. model rate.", type=float, default=0.999
+    )
+    parser.add_argument(
+        "--input_res", help="Input image crop resolution.", type=int, default=64
+    )
+    parser.add_argument(
+        "--input_channels", help="Input image num channels.", type=int, default=1
+    )
+    parser.add_argument("--pad", help="Input padding.", type=int, default=3)
+    parser.add_argument(
+        "--hflip", help="Horizontal flip prob.", type=float, default=0.5
+    )
+    parser.add_argument(
+        "--grad_clip", help="Gradient clipping value.", type=float, default=350
+    )
+    parser.add_argument(
+        "--grad_skip", help="Skip update grad norm threshold.", type=float, default=500
+    )
+    parser.add_argument(
+        "--accu_steps", help="Gradient accumulation steps.", type=int, default=1
+    )
+    parser.add_argument(
+        "--beta", help="Max KL beta penalty weight.", type=float, default=1.0
+    )
+    parser.add_argument(
+        "--beta_warmup_steps", help="KL beta penalty warmup steps.", type=int, default=0
+    )
+    parser.add_argument(
+        "--kl_free_bits", help="KL min free bits constraint.", type=float, default=0.0
+    )
+    parser.add_argument(
+        "--viz_freq", help="Steps per visualisation.", type=int, default=10000
+    )
+    parser.add_argument(
+        "--speed_log_freq",
+        help="Steps between throughput updates during training.",
+        type=int,
+        default=50,
+    )
+    parser.add_argument(
+        "--eval_freq", help="Train epochs per validation.", type=int, default=5
+    )
+    # model
+    parser.add_argument(
+        "--vae",
+        help="VAE model: simple/hierarchical.",
+        type=str,
+        default="hierarchical",
+    )
+    parser.add_argument(
+        "--enc_arch",
+        help="Encoder architecture config.",
+        type=str,
+        default="64b1d2,32b1d2,16b1d2,8b1d8,1b2",
+    )
+    parser.add_argument(
+        "--dec_arch",
+        help="Decoder architecture config.",
+        type=str,
+        default="1b2,8b2,16b2,32b2,64b2",
+    )
+    parser.add_argument(
+        "--cond_prior",
+        help="Use a conditional prior.",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--widths",
+        help="Number of channels.",
+        nargs="+",
+        type=int,
+        default=[16, 32, 48, 64, 128],
+    )
+    parser.add_argument(
+        "--bottleneck", help="Bottleneck width factor.", type=int, default=4
+    )
+    parser.add_argument(
+        "--z_dim", help="Numver of latent channel dims.", type=int, default=16
+    )
+    parser.add_argument(
+        "--z_max_res",
+        help="Max resolution of stochastic z layers.",
+        type=int,
+        default=192,
+    )
+    parser.add_argument(
+        "--bias_max_res",
+        help="Learned bias param max resolution.",
+        type=int,
+        default=64,
+    )
+    parser.add_argument(
+        "--x_like",
+        help="x likelihood: {fixed/shared/diag}_{gauss/dgauss}.",
+        type=str,
+        default="diag_dgauss",
+    )
+    parser.add_argument(
+        "--std_init",
+        help="Initial std for x scale. 0 is random.",
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument(
+        "--parents_x",
+        help="Parents of x to condition on.",
+        nargs="+",
+        default=["mri_seq", "brain_volume", "ventricle_volume", "sex"],
+    )
+    parser.add_argument(
+        "--concat_pa",
+        help="Whether to concatenate parents_x.",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--context_dim",
+        help="Num context variables conditioned on.",
+        type=int,
+        default=4,
+    )
+    parser.add_argument(
+        "--context_norm",
+        help='Conditioning normalisation {"[-1,1]"/"[0,1]"/log_standard}.',
+        type=str,
+        default="log_standard",
+    )
+    parser.add_argument(
+        "--q_correction",
+        help="Use posterior correction.",
+        action="store_true",
+        default=False,
+    )
+    return parser

@@ -1,129 +1,93 @@
-from __future__ import annotations
-
-import json
-import io
-import logging
+import copy
 import os
 import random
 import shutil
 import tempfile
-from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Iterator, Optional, Sequence, Tuple
+from typing import Dict, List, Optional
 
-import time
-
-from runtime import configure_backend_from_argv
-
-configure_backend_from_argv()
-
-import imageio.v2 as imageio
-import jax
-import jax.numpy as jnp
+import imageio
 import numpy as np
+import torch
+import torch.nn as nn
+from torch import Tensor, nn
+
+from hps import Hparams
 
 
-class EvalOnlyFileFilter(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
-        return bool(getattr(record, "eval_log", False) or record.levelno >= logging.WARNING)
-
-
-class SyncFileHandler(logging.FileHandler):
-    def __init__(self, filename: str, mode: str = "a", encoding: str | None = None, delay: bool = False):
-        super().__init__(filename, mode=mode, encoding=encoding, delay=delay)
-
-    def emit(self, record: logging.LogRecord) -> None:
-        super().emit(record)
-        if self.stream is not None and not self.stream.closed:
-            self.flush()
-            try:
-                os.fsync(self.stream.fileno())
-            except OSError:
-                pass
-
-
-def append_text_file(local_path: str, text: str, remote_path: str | None = None) -> None:
-    ensure_parent_dir(local_path)
-    with open(local_path, "a", encoding="utf-8") as f:
-        f.write(text)
-        if text and not text.endswith("\n"):
-            f.write("\n")
-        f.flush()
-        try:
-            os.fsync(f.fileno())
-        except OSError:
-            pass
-    if remote_path:
-        sync_file(local_path, remote_path)
-
-class _NoOpMonitoring:
-    def record_scalar(self, *args, **kwargs):
-        return None
-
-    def record_event(self, *args, **kwargs):
-        return None
-
-    def __getattr__(self, name):
-        return lambda *args, **kwargs: None
-
-
-if not hasattr(jax, "monitoring") or not hasattr(jax.monitoring, "record_scalar") or not hasattr(jax.monitoring, "record_event"):
-    jax.monitoring = _NoOpMonitoring()
-
-import orbax.checkpoint as ocp
-from flax import nnx
-
-from tensorboard.compat.proto.event_pb2 import Event
-from tensorboard.compat.proto.summary_pb2 import Summary
-from tensorboard.summary.writer.event_file_writer import EventFileWriter
-
-
-def seed_all(seed: int, deterministic: bool = True) -> None:
-    random.seed(seed)
+def seed_all(seed, deterministic=True):
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.cuda.manual_seed(seed)
     np.random.seed(seed)
-    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
     if deterministic:
-        os.environ.setdefault("XLA_FLAGS", "--xla_cpu_enable_fast_math=false")
+        if torch.cuda.is_available():
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
 
 
-def normalize(x, x_min=None, x_max=None, zero_one=False):
-    x = jnp.asarray(x, dtype=jnp.float32)
-    if x_min is None:
-        x_min = jnp.min(x)
-    if x_max is None:
-        x_max = jnp.max(x)
-    x = (x - x_min) / (x_max - x_min + 1e-12)
-    return x if zero_one else 2.0 * x - 1.0
+def select_device(accelerator: str) -> torch.device:
+    accelerator = accelerator.lower()
+    if accelerator == "auto":
+        from xla_runtime import tpu_environment_available
+
+        if tpu_environment_available():
+            accelerator = "tpu"
+        elif torch.cuda.is_available():
+            accelerator = "cuda"
+        elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+            accelerator = "mps"
+        else:
+            accelerator = "cpu"
+
+    if accelerator == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested but is not available in this environment.")
+        return torch.device("cuda:0")
+    if accelerator == "mps":
+        if getattr(torch.backends, "mps", None) is None or not torch.backends.mps.is_available():
+            raise RuntimeError("MPS was requested but is not available in this environment.")
+        return torch.device("mps")
+    if accelerator == "cpu":
+        return torch.device("cpu")
+    if accelerator == "tpu":
+        from xla_runtime import xla_device
+
+        return xla_device()
+
+    raise ValueError(f"Unknown accelerator: {accelerator}")
 
 
-def log_standardize(x):
-    x = jnp.asarray(x, dtype=jnp.float32)
-    lx = jnp.log(jnp.maximum(x, 1e-12))
-    return (lx - jnp.mean(lx)) / jnp.maximum(jnp.std(lx), 1e-12)
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 def linear_warmup(warmup_iters):
-    def f(step):
-        return jnp.where(step > warmup_iters, 1.0, step / jnp.maximum(1, warmup_iters))
+    def f(iter):
+        return 1.0 if iter > warmup_iters else iter / warmup_iters
 
     return f
 
 
-def exists(val) -> bool:
-    return val is not None
+def _remote_fs(path: str):
+    if not path.startswith("gs://"):
+        return None
+
+    try:
+        import fsspec
+    except ImportError as exc:
+        raise ImportError(
+            "GCS paths require the optional 'gcsfs' dependency."
+        ) from exc
+
+    return fsspec.filesystem("gcs")
 
 
 def is_remote_path(path: str) -> bool:
     return path.startswith("gs://")
-
-
-def _remote_fs(path: str):
-    if not is_remote_path(path):
-        return None
-    try:
-        import fsspec
-    except ImportError as exc:
-        raise ImportError("GCS paths require fsspec/gcsfs.") from exc
-    return fsspec.filesystem("gcs")
 
 
 def local_staging_path(remote_path: str) -> str:
@@ -133,7 +97,12 @@ def local_staging_path(remote_path: str) -> str:
 
 def open_file(path: str, mode: str = "rb"):
     if is_remote_path(path):
-        import fsspec
+        try:
+            import fsspec
+        except ImportError as exc:
+            raise ImportError(
+                "GCS paths require the optional 'gcsfs' dependency."
+            ) from exc
 
         return fsspec.open(path, mode=mode).open()
     return open(path, mode)
@@ -150,6 +119,7 @@ def ensure_parent_dir(path: str):
     parent = os.path.dirname(path)
     if not parent:
         return
+
     fs = _remote_fs(parent)
     if fs is None:
         os.makedirs(parent, exist_ok=True)
@@ -165,455 +135,422 @@ def ensure_dir(path: str):
         fs.makedirs(path, exist_ok=True)
 
 
-def checkpoint_root_dir(save_dir: str) -> str:
-    return os.path.abspath(os.path.join(save_dir, "checkpoints"))
-
-
-def experiment_run_dir(root_dir: str, hps: str, exp_name: str, default_name: str) -> str:
-    if not root_dir:
-        return ""
-    return os.path.join(root_dir, hps, exp_name or default_name)
-
-
-def materialize_nnx(graphdef, params):
-    return nnx.merge(graphdef, nnx.State(params))
-
-
-def viz_path_for_step(save_dir: str, step: int) -> str:
-    return os.path.join(save_dir, f"viz-step-{int(step)}.png")
-
-
 def sync_file(local_path: str, remote_path: str) -> None:
-    if not is_remote_path(remote_path) or local_path == remote_path:
+    if local_path == remote_path or not is_remote_path(remote_path):
         return
+
     ensure_parent_dir(remote_path)
     with open(local_path, "rb") as src, open_file(remote_path, "wb") as dst:
         shutil.copyfileobj(src, dst)
 
 
 def sync_tree(local_dir: str, remote_dir: str) -> None:
-    if not is_remote_path(remote_dir) or local_dir == remote_dir:
+    if local_dir == remote_dir or not is_remote_path(remote_dir):
         return
+
     ensure_dir(remote_dir)
     for root, _, files in os.walk(local_dir):
         rel_root = os.path.relpath(root, local_dir)
         for name in files:
             local_path = os.path.join(root, name)
-            remote_path = remote_dir if rel_root == "." else os.path.join(remote_dir, rel_root)
-            sync_file(local_path, os.path.join(remote_path, name))
+            remote_path = remote_dir
+            if rel_root != ".":
+                remote_path = os.path.join(remote_path, rel_root)
+            remote_path = os.path.join(remote_path, name)
+            sync_file(local_path, remote_path)
 
 
-def _is_legacy_checkpoint_file(path: str) -> bool:
-    return path.endswith(".pt") or path.endswith(".pkl")
+def remove_path(path: str):
+    fs = _remote_fs(path)
+    if fs is None:
+        shutil.rmtree(path)
+    else:
+        fs.rm(path, recursive=True)
 
 
-def _checkpoint_manager(root_dir: str, *, create: bool) -> ocp.CheckpointManager:
-    options = ocp.CheckpointManagerOptions(
-        max_to_keep=3,
-        create=create,
-        save_interval_steps=1,
-        enable_async_checkpointing=False,
+def beta_anneal(beta, step, anneal_steps):
+    return min(beta, (max(1e-11, step) / anneal_steps) ** 2)
+
+
+def normalize(x, x_min=None, x_max=None, zero_one=False):
+    if x_min is None:
+        x_min = x.min()
+    if x_max is None:
+        x_max = x.max()
+    from xla_runtime import master_print
+
+    master_print(f"max: {x_max}, min: {x_min}")
+    x = (x - x_min) / (x_max - x_min)  # [0,1]
+    return x if zero_one else 2 * x - 1  # else [-1,1]
+
+
+def log_standardize(x):
+    log_x = torch.log(x.clamp(min=1e-12))
+    return (log_x - log_x.mean()) / log_x.std().clamp(min=1e-12)  # mean=0, std=1
+
+
+def exists(val):
+    return val is not None
+
+
+def is_float_dtype(dtype):
+    return any(
+        [
+            dtype == float_dtype
+            for float_dtype in (
+                torch.float64,
+                torch.float32,
+                torch.float16,
+                torch.bfloat16,
+            )
+        ]
     )
-    return ocp.CheckpointManager(root_dir, options=options)
-
-
-def save_checkpoint(data: Dict[str, Any], path: str, step: Optional[int] = None, custom_metadata: Optional[Dict[str, Any]] = None) -> None:
-    if _is_legacy_checkpoint_file(path):
-        ensure_parent_dir(path)
-        import pickle
-
-        with open(path, "wb") as f:
-            pickle.dump(data, f)
-        return
-
-    path = os.path.abspath(path)
-    ensure_dir(path)
-    item = dict(data)
-    metadata = dict(custom_metadata or {})
-    hparams = item.pop("hparams", None)
-    if hparams is not None:
-        metadata.setdefault("hparams", hparams)
-        with open(os.path.join(path, "hparams.json"), "w", encoding="utf-8") as f:
-            json.dump(hparams, f, indent=2, sort_keys=True)
-    manager = _checkpoint_manager(path, create=True)
-    try:
-        save_step = int(step if step is not None else data.get("step", 0))
-        manager.save(
-            save_step,
-            args=ocp.args.StandardSave(item=item, custom_metadata=metadata),
-        )
-        manager.wait_until_finished()
-    finally:
-        manager.close()
-
-
-def _save_checkpoint_and_sync(
-    data: Dict[str, Any],
-    path: str,
-    step: Optional[int],
-    custom_metadata: Optional[Dict[str, Any]],
-    local_tree_dir: Optional[str],
-    remote_tree_dir: Optional[str],
-) -> None:
-    save_checkpoint(data, path, step=step, custom_metadata=custom_metadata)
-    if local_tree_dir and remote_tree_dir:
-        sync_tree(local_tree_dir, remote_tree_dir)
-
-
-class BackgroundArtifactWriter:
-    """Serialize artifact saves on the caller thread."""
-
-    def __init__(self):
-        self._closed = False
-
-    def _submit_job(
-        self,
-        fn,
-        *args,
-        **kwargs,
-    ):
-        if self._closed:
-            raise RuntimeError("BackgroundArtifactWriter is closed.")
-        return fn(*args, **kwargs)
-
-    def submit_checkpoint(
-        self,
-        data: Dict[str, Any],
-        path: str,
-        step: Optional[int] = None,
-        custom_metadata: Optional[Dict[str, Any]] = None,
-        local_tree_dir: Optional[str] = None,
-        remote_tree_dir: Optional[str] = None,
-    ):
-        self._submit_job(
-            _save_checkpoint_and_sync,
-            data,
-            path,
-            step,
-            custom_metadata,
-            local_tree_dir,
-            remote_tree_dir,
-        )
-        return path
-
-    def submit_viz(
-        self,
-        args,
-        model,
-        params,
-        batch,
-        rng_key=None,
-        step: Optional[int] = None,
-    ):
-        viz_step = int(step if step is not None else getattr(args, "iter", 0))
-        viz_path = viz_path_for_step(args.save_dir, viz_step)
-        self._submit_job(write_images, args, model, params, batch, rng_key, step)
-        return viz_path
-
-    def flush(self):
-        return None
-
-    def close(self):
-        if self._closed:
-            return
-        self._closed = True
-
-
-AsyncCheckpointWriter = BackgroundArtifactWriter
-
-
-def load_checkpoint(path: str, template: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    if _is_legacy_checkpoint_file(path):
-        import pickle
-
-        with open(path, "rb") as f:
-            return pickle.load(f)
-
-    if os.path.isdir(path) and os.path.isfile(os.path.join(path, "_CHECKPOINT_METADATA")):
-        parent_dir = os.path.dirname(path)
-        step_name = os.path.basename(path)
-        try:
-            step = int(step_name)
-        except ValueError as exc:
-            raise ValueError(f"Unsupported Orbax step directory: {path}") from exc
-        manager = _checkpoint_manager(parent_dir, create=False)
-        try:
-            restored = manager.restore(step, args=ocp.args.StandardRestore(item=template))
-            hparams_path = os.path.join(parent_dir, "hparams.json")
-            if os.path.isfile(hparams_path):
-                with open(hparams_path, "r", encoding="utf-8") as f:
-                    restored["hparams"] = json.load(f)
-            return restored
-        finally:
-            manager.close()
-
-    manager = _checkpoint_manager(path, create=False)
-    try:
-        step = manager.latest_step()
-        if step is None:
-            raise FileNotFoundError(f"No Orbax checkpoints found in {path}")
-        restored = manager.restore(step, args=ocp.args.StandardRestore(item=template))
-        hparams_path = os.path.join(path, "hparams.json")
-        if os.path.isfile(hparams_path):
-            with open(hparams_path, "r", encoding="utf-8") as f:
-                restored["hparams"] = json.load(f)
-        return restored
-    finally:
-        manager.close()
-
-
-def tree_copy(tree):
-    return jax.tree_util.tree_map(lambda x: x.copy() if hasattr(x, "copy") else x, tree)
-
-
-@dataclass
-class EMA:
-    params: Any
-    decay: float = 0.999
-
-    @classmethod
-    def init_from(cls, params, decay: float = 0.999):
-        return cls(params=tree_copy(params), decay=decay)
-
-    def update(self, params):
-        self.params = jax.tree_util.tree_map(
-            lambda e, p: self.decay * e + (1.0 - self.decay) * p, self.params, params
-        )
 
 
 def clamp(value, min_value=None, max_value=None):
-    if min_value is not None:
-        value = jnp.maximum(value, min_value)
-    if max_value is not None:
-        value = jnp.minimum(value, max_value)
+    assert exists(min_value) or exists(max_value)
+    if exists(min_value):
+        value = max(value, min_value)
+
+    if exists(max_value):
+        value = min(value, max_value)
+
     return value
 
 
-def _to_uint8_image(x: np.ndarray) -> np.ndarray:
-    x = np.asarray(x)
-    if x.dtype != np.uint8:
-        x = np.clip(x, 0, 255).astype(np.uint8)
-    return x
+class EMA(nn.Module):
+    """
+    Adapted from: https://github.com/lucidrains/ema-pytorch/blob/main/ema_pytorch/ema_pytorch.py
+    Implements exponential moving average shadowing for your model.
 
+    Utilizes an inverse decay schedule to manage longer term training runs.
+    By adjusting the power, you can control how fast EMA will ramp up to your specified beta.
 
-def postprocess(x):
-    x = np.asarray(x)
-    x = (x + 1.0) * 127.5
-    return np.clip(x, 0, 255).astype(np.uint8)
+    @crowsonkb's notes on EMA Warmup:
 
+    If gamma=1 and power=1, implements a simple average. gamma=1, power=2/3 are
+    good values for models you plan to train for a million or more steps (reaches decay
+    factor 0.999 at 31.6K steps, 0.9999 at 1M steps), gamma=1, power=3/4 for models
+    you plan to train for less (reaches decay factor 0.999 at 10K steps, 0.9999 at
+    215.4k steps).
 
-def _ensure_nhwc(images: np.ndarray) -> np.ndarray:
-    images = np.asarray(images)
-    if images.ndim == 4 and images.shape[1] in (1, 3):
-        return np.transpose(images, (0, 2, 3, 1))
-    return images
+    Args:
+        inv_gamma (float): Inverse multiplicative factor of EMA warmup. Default: 1.
+        power (float): Exponential factor of EMA warmup. Default: 1.
+        min_value (float): The minimum EMA decay rate. Default: 0.
+    """
 
+    def __init__(
+        self,
+        model,
+        beta=0.999,
+        update_after_step=100,
+        update_every=1,
+        inv_gamma=1.0,
+        power=1.0,
+        min_value=0.0,
+        param_or_buffer_names_no_ema=set(),
+    ):
+        super().__init__()
+        self.beta = beta
+        self.online_model = model
 
-def _repeat_batch(value: np.ndarray, count: int) -> np.ndarray:
-    value = jnp.asarray(value)
-    return jnp.repeat(value[None, ...], count, axis=0)
+        try:
+            self.ema_model = copy.deepcopy(model)
+        except:
+            print(
+                "Your model was not copyable. Please make sure you are not using any LazyLinear"
+            )
+            exit()
 
+        self.ema_model.requires_grad_(False)
+        self.update_every = update_every
+        self.update_after_step = update_after_step
 
-def _morphomnist_counterfactual_parents(base_pa: np.ndarray, source_idx: int, target_idx: int, context_dim: int, input_res: int) -> tuple[np.ndarray, np.ndarray]:
-    pa = _repeat_batch(base_pa[source_idx], context_dim)
-    cf_pa = pa.copy()
-    cf_pa = cf_pa.at[0, 0].set(base_pa[target_idx, 0])
-    cf_pa = cf_pa.at[1, 1].set(base_pa[target_idx, 1])
-    cf_pa = cf_pa.at[2:, 2:].set(jnp.eye(10, dtype=cf_pa.dtype))
-    pa = jnp.repeat(jnp.repeat(pa[:, None, None, :], input_res, axis=1), input_res, axis=2)
-    cf_pa = jnp.repeat(jnp.repeat(cf_pa[:, None, None, :], input_res, axis=1), input_res, axis=2)
-    return pa, cf_pa
+        self.inv_gamma = inv_gamma
+        self.power = power
+        self.min_value = min_value
 
+        assert isinstance(param_or_buffer_names_no_ema, (set, list))
+        self.param_or_buffer_names_no_ema = (
+            param_or_buffer_names_no_ema  # parameter or buffer
+        )
 
-def make_image_grid(images: Sequence[np.ndarray], n_rows: int, n_cols: int) -> np.ndarray:
-    rows = [np.asarray(img) for img in images]
-    if rows[0].ndim == 3:
-        rows = [row[None, ...] for row in rows]
-    if rows[0].ndim != 4:
-        raise ValueError(f"Expected 4D row tensors, got shape {rows[0].shape}.")
-    n_cols = min(n_cols, rows[0].shape[0])
-    h, w = rows[0].shape[1:3]
-    c = rows[0].shape[-1]
-    padded_rows = []
-    for row in rows:
-        if row.shape[0] < n_cols:
-            pad = np.zeros((n_cols - row.shape[0], h, w, c), dtype=row.dtype)
-            row = np.concatenate([row, pad], axis=0)
-        padded_rows.append(row[:n_cols])
-    im = (
-        np.concatenate(padded_rows, axis=0)
-        .reshape((n_rows, n_cols, h, w, c))
-        .transpose([0, 2, 1, 3, 4])
-        .reshape([n_rows * h, n_cols * w, c])
-    )
-    return im.squeeze(-1) if im.ndim == 3 and im.shape[-1] == 1 else im
+        self.register_buffer("initted", torch.Tensor([False]))
+        self.register_buffer("step", torch.tensor([0]))
 
+    def restore_ema_model_device(self):
+        device = self.initted.device
+        self.ema_model.to(device)
 
-def batch_iterator(
-    dataset,
-    batch_size: int,
-    shuffle: bool,
-    seed: int,
-    *,
-    drop_remainder: bool = False,
-) -> Iterator[Dict[str, np.ndarray]]:
-    rng = np.random.default_rng(seed)
-    indices = np.arange(len(dataset))
-    while True:
-        if shuffle:
-            rng.shuffle(indices)
-        for start in range(0, len(indices), batch_size):
-            batch_idx = indices[start : start + batch_size]
-            if drop_remainder and len(batch_idx) < batch_size:
+    def copy_params_from_model_to_ema(self):
+        for ma_params, current_params in zip(
+            list(self.ema_model.parameters()), list(self.online_model.parameters())
+        ):
+            if not is_float_dtype(current_params.dtype):
                 continue
-            if hasattr(dataset, "make_batch"):
-                yield dataset.make_batch(batch_idx, rng=rng, shuffle=shuffle)
+
+            ma_params.data.copy_(current_params.data)
+
+        for ma_buffers, current_buffers in zip(
+            list(self.ema_model.buffers()), list(self.online_model.buffers())
+        ):
+            if not is_float_dtype(current_buffers.dtype):
                 continue
-            batch = [dataset[int(i)] for i in batch_idx]
-            keys = batch[0].keys()
-            out = {}
-            for k in keys:
-                values = [np.asarray(item[k]) for item in batch]
-                out[k] = np.stack(values, axis=0)
-            yield out
+
+            ma_buffers.data.copy_(current_buffers.data)
+
+    def get_current_decay(self):
+        epoch = clamp(self.step.item() - self.update_after_step - 1, min_value=0.0)
+        value = 1 - (1 + epoch / self.inv_gamma) ** -self.power
+
+        if epoch <= 0:
+            return 0.0
+
+        return clamp(value, min_value=self.min_value, max_value=self.beta)
+
+    def update(self):
+        step = self.step.item()
+        self.step += 1
+
+        if (step % self.update_every) != 0:
+            return
+
+        if step <= self.update_after_step:
+            self.copy_params_from_model_to_ema()
+            return
+
+        if not self.initted.item():
+            self.copy_params_from_model_to_ema()
+            self.initted.data.copy_(torch.Tensor([True]))
+
+        self.update_moving_average(self.ema_model, self.online_model)
+
+    @torch.no_grad()
+    def update_moving_average(self, ma_model, current_model):
+        current_decay = self.get_current_decay()
+
+        for (name, current_params), (_, ma_params) in zip(
+            list(current_model.named_parameters()), list(ma_model.named_parameters())
+        ):
+            if not is_float_dtype(current_params.dtype):
+                continue
+
+            if name in self.param_or_buffer_names_no_ema:
+                ma_params.data.copy_(current_params.data)
+                continue
+
+            difference = ma_params.data - current_params.data
+            difference.mul_(1.0 - current_decay)
+            ma_params.sub_(difference)
+
+        for (name, current_buffer), (_, ma_buffer) in zip(
+            list(current_model.named_buffers()), list(ma_model.named_buffers())
+        ):
+            if not is_float_dtype(current_buffer.dtype):
+                continue
+
+            if name in self.param_or_buffer_names_no_ema:
+                ma_buffer.data.copy_(current_buffer.data)
+                continue
+
+            difference = ma_buffer - current_buffer
+            difference.mul_(1.0 - current_decay)
+            ma_buffer.sub_(difference)
+
+    def __call__(self, *args, **kwargs):
+        return self.ema_model(*args, **kwargs)
 
 
-def write_images(args, model, params, batch, rng_key=None, step: Optional[int] = None):
-    viz_batch_size = int(getattr(args, "viz_batch_size", getattr(args, "viz_bs", 32)))
-    x = np.asarray(batch["x"], dtype=np.float32)
-    if x.max() > 1.5:
-        x = (x - 127.5) / 127.5
-    pa = np.asarray(batch["pa"], dtype=np.float32)
-    if x.ndim == 4 and x.shape[1] in (1, 3):
-        x = np.transpose(x, (0, 2, 3, 1))
-    if pa.ndim == 2:
-        pa = pa[:, :, None, None]
-        pa = np.repeat(pa, args.input_res, axis=2)
-        pa = np.repeat(pa, args.input_res, axis=3)
-        pa = np.transpose(pa, (0, 2, 3, 1))
-    elif pa.ndim == 4 and pa.shape[1] == args.context_dim and pa.shape[-1] == args.input_res:
-        pa = np.transpose(pa, (0, 2, 3, 1))
-    viz_batch_size = max(1, min(viz_batch_size, x.shape[0]))
-    x = x[:viz_batch_size]
-    pa = pa[:viz_batch_size]
-    model = materialize_nnx(model, params)
-    bs = int(min(viz_batch_size, x.shape[0]))
-    x = x[:bs]
-    x_jax = jnp.asarray(x)
-    pa_jax = jnp.asarray(pa)
-    rows = [postprocess(x)]
+def write_images(args: Hparams, model: nn.Module, batch: Dict[str, Tensor]):
+    bs, c, h, w = batch["x"].shape
+    # original imgs, channels last, [0,255]
+    orig = (batch["x"].permute(0, 2, 3, 1) + 1.0) * 127.5
+    import numpy as np; import numpy as np; import numpy as np; import numpy as np; import numpy as np; import numpy as np; import numpy as np; orig = orig.detach().cpu().numpy().astype(np.uint8)
+    viz_images = [orig]
 
-    def _append_counterfactual_rows(zs, pa_ctx, cf_pa_ctx, x_ctx, alpha, t):
-        x_rec, _ = model.forward_latents(latents=zs, parents=pa_ctx, t=t)
+    def postprocess(x: Tensor):
+        x = (x.permute(0, 2, 3, 1) + 1.0) * 127.5  # channels last, [0,255]
+        return x.detach().cpu().numpy()
+
+    def pseudo_counterfactuals(
+        model: nn.Module,
+        z: List[Tensor],
+        pa: Dict[str, Tensor],
+        cf_pa: Dict[str, Tensor],
+        x: Optional[Tensor] = None,
+        alpha: Optional[float] = None,
+        t: Optional[float] = None,
+    ):
+        """Note that this function is only here for debugging purposes.
+        It does not take into account the associated causal graph nor infer x's
+        (observation space) exogenous noise term "u". For a complete example of
+        counterfactual inference you may refer to pgm/dscm.py or our demo:
+
+          https://huggingface.co/spaces/mira-causality/counterfactuals/blob/main/app.py
+          (specifically the counterfactual_inference() function).
+
+        """
+        # x = g(pa, z)
+        x_rec, _ = model.forward_latents(latents=z, parents=pa, t=t)
         x_rec = postprocess(x_rec)
 
-        cf_x, _ = model.forward_latents(latents=zs, parents=cf_pa_ctx, t=t)
-        cf_x = postprocess(cf_x)
-        rows.append(cf_x.astype(np.uint8))
-        rows.append((cf_x - x_rec).astype(np.uint8))
+        # x* = g(pa*, z), direct effect counterfactual
+        cf_x, _ = model.forward_latents(latents=z, parents=cf_pa, t=t)
+        _x = postprocess(cf_x)
+        viz_images.append(_x.astype(np.uint8))
+        viz_images.append((_x - x_rec).astype(np.uint8))
 
-        if getattr(model, "cond_prior", False):
-            # Match the Torch visualization path: re-abduct on the counterfactual parents
-            # and show the indirect and total effect rows as well.
-            cf_z = model.abduct(x=x_ctx, parents=pa_ctx, cf_parents=cf_pa_ctx, alpha=alpha, t=t)
+        if model.cond_prior:
+            cf_z = model.abduct(x=x, parents=pa, cf_parents=cf_pa, alpha=alpha, t=t)
+            # alternative: z* ~ q(z* | x*, pa*)
+            # cf_z = model.abduct(x=cf_x, parents=cf_pa)
 
-            x_indirect, _ = model.forward_latents(latents=cf_z, parents=pa_ctx, t=t)
-            x_indirect = postprocess(x_indirect)
-            rows.append(x_indirect.astype(np.uint8))
-            rows.append((x_indirect - x_rec).astype(np.uint8))
+            # x* = g(pa, z*), indirect effect counterfactual
+            _x, _ = model.forward_latents(latents=cf_z, parents=pa, t=t)
+            _x = postprocess(_x)
+            viz_images.append(_x.astype(np.uint8))
+            viz_images.append((_x - x_rec).astype(np.uint8))
 
-            x_total, _ = model.forward_latents(latents=cf_z, parents=cf_pa_ctx, t=t)
-            x_total = postprocess(x_total)
-            rows.append(x_total.astype(np.uint8))
-            rows.append((x_total - x_rec).astype(np.uint8))
+            # x* = g(pa*, z*), total effect counterfactual
+            _x, _ = model.forward_latents(latents=cf_z, parents=cf_pa, t=t)
+            _x = postprocess(_x)
+            viz_images.append(_x.astype(np.uint8))
+            viz_images.append((_x - x_rec).astype(np.uint8))
+        return
 
-    try:
-        zs = model.abduct(x=x_jax, parents=pa_jax)
-        n_latents_viz = 0
-        l_points = np.floor(np.linspace(0, 1, n_latents_viz + 2) * len(zs)).astype(int)[1:]
-        for l in l_points:
-            if getattr(model, "cond_prior", False):
-                latents = [zs[i]["z"] for i in range(l)]
-            else:
-                latents = zs[:l]
-            x_rec, _ = model.forward_latents(latents=latents, parents=pa_jax, t=0.1)
-            rows.append(postprocess(x_rec))
-    except AttributeError:
-        pass
+    # reconstructions, first abduct z from q(z|x,pa)
+    zs = model.abduct(x=batch["x"], parents=batch["pa"])
+    # print(len(zs), zs[0]['z'].keys())
+    n_latents_viz = 0  # 0 for simple vae
+    l_points = np.floor(np.linspace(0, 1, n_latents_viz + 2) * len(zs)).astype(int)[
+        1:
+    ]  # [1:-1]
 
-    rows.append(postprocess(x * 0))
+    for l in l_points:
+        # reconstruc using first l latent z's
+        if model.cond_prior:
+            z_l = [zs[i]["z"] for i in range(l)]
+        else:
+            z_l = zs[:l]
+        x, _ = model.forward_latents(latents=z_l, parents=batch["pa"], t=0.1)
+        x = postprocess(x)
+        viz_images.append(x.astype(np.uint8))
+    viz_images.append(orig * 0)
+
+    # random samples at different temps
     for temp in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]:
-        sample, _ = model.sample(parents=pa_jax, return_loc=True, t=temp, rng=rng_key)
-        rows.append(postprocess(sample))
+        x, _ = model.sample(parents=batch["pa"], return_loc=True, t=temp)
+        x = postprocess(x)
+        viz_images.append(x.astype(np.uint8))
 
-    if "morphomnist" in getattr(args, "hps", ""):
-        base_pa = np.asarray(pa)[:bs]
-        if base_pa.ndim == 4:
-            base_pa = base_pa[:, 0, 0, :]
-        idx = np.arange(bs)
-        np.random.RandomState(1).shuffle(idx)
-        alpha, t = 0.6, 0.5
-        for l in l_points:
-            rows.append(postprocess(x * 0))
-            for ii in range(bs):
-                if getattr(model, "cond_prior", False):
-                    x_ctx = _repeat_batch(x[ii], args.context_dim)
+    # compute counterfactuals
+    idx = np.arange(bs)
+    rng = np.random.RandomState(1)
+    rng.shuffle(idx)
+    alpha, t = 0.6, 0.5
+
+    # undo input res repetition of parents for compatbility with simple vae
+    if args.expand_pa:
+        _pa = batch["pa"][:, :, 0, 0].clone()
+        assert len(_pa.shape) == 2
+    else:
+        _pa = batch["pa"].clone()
+
+    for l in l_points:
+        viz_images.append(orig * 0)  # empty row
+
+        for ii in range(bs):
+            # copy ith (x, pa), repeat it for num attribute we can intervene
+            if model.cond_prior:
+                x = copy.deepcopy(batch["x"][ii])
+                x = x[None, ...].repeat(args.context_dim, 1, 1, 1)
+            pa = copy.deepcopy(_pa[ii])
+            pa = pa[None, ...].repeat(args.context_dim, 1)
+            # intervening on each attribute separately
+            cf_pa = pa.clone()
+
+            # format interventional parents according to each dataset
+            if "ukbb" in args.hps:
+                if args.parents_x == [
+                    "mri_seq",
+                    "brain_volume",
+                    "ventricle_volume",
+                    "sex",
+                ]:
+                    assert args.context_dim == 4
+                    cf_pa[0, 0] = 1 - cf_pa[0, 0]  # invert mri_seq
+                    cf_pa[1, 1] = _pa[idx[ii], 1]  # random bvol intervention
+                    cf_pa[2, 2] = _pa[idx[ii], 2]  # random vvol intervention
+                    cf_pa[3, 3] = 1 - cf_pa[3, 3]  # invert sex
+                elif args.parents_x == ["mri_seq", "brain_volume", "ventricle_volume"]:
+                    assert args.context_dim == 3
+                    cf_pa[0, 0] = 1 - cf_pa[0, 0]  # invert mri_seq
+                    cf_pa[1, 1] = _pa[idx[ii], 1]  # random bvol intervention
+                    cf_pa[2, 2] = _pa[idx[ii], 2]  # random vvol intervention
                 else:
-                    x_ctx = None
-                pa_ctx, cf_pa_ctx = _morphomnist_counterfactual_parents(
-                    base_pa=base_pa,
-                    source_idx=ii,
-                    target_idx=idx[ii],
-                    context_dim=args.context_dim,
-                    input_res=args.input_res,
-                )
-                z_i = []
-                for z in zs:
-                    if getattr(model, "cond_prior", False):
-                        z_dict = {}
-                        for k, v in z.items():
-                            z_dict[k] = _repeat_batch(v[ii], args.context_dim)
-                        z_i.append(z_dict)
-                    else:
-                        z_i.append(_repeat_batch(z[ii], args.context_dim))
-                if getattr(model, "cond_prior", False):
-                    latents = [z_i[j]["z"] for j in range(l)]
+                    NotImplementedError(f"{args.parents_x} not configured.")
+
+            elif "morphomnist" in args.hps:
+                assert args.context_dim == 12
+                cf_pa[0, 0] = _pa[idx[ii], 0]  # random thickness intervention
+                cf_pa[1, 1] = _pa[idx[ii], 1]  # random intensity intervention
+                cf_pa[2:, 2:] = torch.eye(10)  # intervention for each digit
+
+            elif "cmnist" in args.hps:
+                assert args.context_dim == 20
+                cf_pa[:10, :10] = torch.eye(10)  # intervention for each digit
+                cf_pa[10:, 10:] = torch.eye(10)  # intervention for each colour
+            else:
+                NotImplementedError
+
+            # repeat conditioning by input res, used for HVAE parent concatenation
+            if args.expand_pa:
+                pa = pa[..., None, None].repeat(1, 1, *(args.input_res,) * 2)
+                cf_pa = cf_pa[..., None, None].repeat(1, 1, *(args.input_res,) * 2)
+
+            # resolves to (1) for simple vae or (1,1,1) for HVAE
+            n_dims = (len(pa.shape) - 1) * (1,)
+
+            # to get counterfactuals of each attribute using same z
+            z_i = []
+            for z in zs:
+                if model.cond_prior:
+                    assert type(z) is dict
+                    z_dict = {}
+                    for k, v in z.items():
+                        z_dict[k] = v[ii].repeat(args.context_dim, *n_dims)
+                    z_i.append(z_dict)
                 else:
-                    latents = z_i[:l]
-                _append_counterfactual_rows(latents, pa_ctx, cf_pa_ctx, x_ctx, alpha, t)
-                rows.append(postprocess(x * 0))
+                    z_i.append(z[ii].repeat(args.context_dim, *n_dims))
 
-    for j, img in enumerate(rows):
-        if img.shape[0] < bs:
-            pad = np.zeros((bs - img.shape[0], *img.shape[1:]), dtype=np.uint8)
-            rows[j] = np.concatenate([img, pad], axis=0)
+            # for partial abduction of z, e.g. fix first l latent z's only
+            if model.cond_prior:
+                z_l = [z_i[j]["z"] for j in range(l)]
+            else:
+                z_l = z_i[:l]
 
-    grid = make_image_grid(rows, n_rows=len(rows), n_cols=bs)
-    viz_step = int(step if step is not None else getattr(args, "iter", 0))
-    viz_path = viz_path_for_step(args.save_dir, viz_step)
-    imageio.imwrite(viz_path, grid)
-    remote_run_dir = getattr(args, "remote_save_dir", "")
-    if remote_run_dir:
-        sync_file(viz_path, viz_path_for_step(remote_run_dir, viz_step))
-    return viz_path
+            if model.cond_prior:
+                pseudo_counterfactuals(model, z_l, pa, cf_pa, x=x, alpha=alpha, t=t)
+            else:
+                pseudo_counterfactuals(model, z_l, pa, cf_pa, t=t)
+            viz_images.append(orig * 0)  # empty row
 
-
-class SummaryWriter:
-    def __init__(self, logdir: str):
-        ensure_dir(logdir)
-        self._writer = EventFileWriter(logdir)
-
-    def add_scalar(self, tag: str, value: float, step: int):
-        event = Event(
-            wall_time=time.time(),
-            step=int(step),
-            summary=Summary(value=[Summary.Value(tag=tag, simple_value=float(value))]),
-        )
-        self._writer.add_event(event)
-        self._writer.flush()
-
-    def flush(self):
-        self._writer.flush()
-
-    def close(self):
-        self._writer.close()
+    # zero pad each row to have same number of columns for plotting
+    for j, img in enumerate(viz_images):
+        s = img.shape[0]
+        if s < bs:
+            pad = np.zeros((bs - s, *img.shape[1:])).astype(np.uint8)
+            viz_images[j] = np.concatenate([img, pad], axis=0)
+    # concat all images and save to disk
+    n_rows = len(viz_images)
+    im = (
+        np.concatenate(viz_images, axis=0)
+        .reshape((n_rows, bs, h, w, c))
+        .transpose([0, 2, 1, 3, 4])
+        .reshape([n_rows * h, bs * w, c])
+    )
+    viz_path = os.path.join(args.save_dir, f"viz-{args.iter}.png")
+    import numpy as np; imageio.imwrite(viz_path, np.squeeze(im) if im.ndim == 3 and im.shape[-1] == 1 else im)
+    if hasattr(args, "remote_save_dir"):
+        sync_file(viz_path, os.path.join(args.remote_save_dir, f"viz-{args.iter}.png"))

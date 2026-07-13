@@ -1,50 +1,30 @@
 #!/bin/bash
-if [ "${CONDA_DEFAULT_ENV:-}" != "med-jax" ]; then
+if [ "${CONDA_DEFAULT_ENV:-}" != "med-torch" ]; then
   CONDA_BASE="$(conda info --base 2>/dev/null)"
   if [ -z "$CONDA_BASE" ] || [ ! -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then
-    echo "Unable to locate conda.sh for med-jax activation." >&2
+    echo "Unable to locate conda.sh for med-torch activation." >&2
     exit 1
   fi
   . "$CONDA_BASE/etc/profile.d/conda.sh"
-  conda activate med-jax
+  conda activate med-torch
 fi
-
-export JAX_PLATFORMS=cpu
-export JAX_PLATFORM_NAME=cpu
-export CUDA_VISIBLE_DEVICES=""
 
 exp_name="${1:-local_run_$(date +%Y%m%d_%H%M%S)}"
 extra_args=()
 run_nohup=false
-run_smoke=false
 
 for arg in "${@:2}"; do
   if [ "$arg" = "nohup" ]; then
     run_nohup=true
-  elif [ "$arg" = "smoke" ]; then
-    run_smoke=true
   else
     extra_args+=("$arg")
   fi
 done
 
-if [ "$run_smoke" = true ]
-then
-  extra_args+=(
-    --epochs=1
-    --checkpoint_smoke_test
-    --checkpoint_smoke_steps=1
-    --eval_freq=1000000
-  )
-fi
-
-run_cmd=(python -u main.py
-  --accelerator=cpu
-  --precision=fp32
+run_cmd=(python main.py
   --exp_name="$exp_name"
   --data_dir=gs://medical-airnd/causal-gen/datasets/morphomnist
-  --ckpt_dir=../checkpoints
-  --remote_ckpt_dir=gs://medical-airnd/causal-gen/checkpoints
+  --ckpt_dir=gs://medical-airnd/causal-gen/checkpoints
   --hps morphomnist
   --parents_x thickness intensity digit
   --context_dim=12
@@ -54,10 +34,23 @@ run_cmd=(python -u main.py
   --wd=0.01
   --beta=1
   --cond_prior
-  --eval_freq=50
-  --checkpoint_freq=50
-  --viz_batch_size=32
+  --eval_freq=4
   "${extra_args[@]}")
+
+# run_cmd="python main.py \
+#     --exp_name=$exp_name \
+#     --data_dir=/data2/ukbb \
+#     --hps ukbb192 \
+#     --parents_x mri_seq brain_volume ventricle_volume sex \
+#     --context_dim=4 \
+#     --concat_pa \
+#     --lr=0.001 \
+#     --bs=32 \
+#     --wd=0.05 \
+#     --beta=5 \
+#     --x_like=diag_dgauss \
+#     --z_max_res=96 \
+#     --eval_freq=4"
 
 if [ "$run_nohup" = true ]
 then
