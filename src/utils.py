@@ -30,7 +30,11 @@ def seed_all(seed, deterministic=True):
 def select_device(accelerator: str) -> torch.device:
     accelerator = accelerator.lower()
     if accelerator == "auto":
-        if torch.cuda.is_available():
+        from xla_runtime import tpu_environment_available
+
+        if tpu_environment_available():
+            accelerator = "tpu"
+        elif torch.cuda.is_available():
             accelerator = "cuda"
         elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
             accelerator = "mps"
@@ -56,6 +60,10 @@ def select_device(accelerator: str) -> torch.device:
         return xm.xla_device()
     if accelerator == "cpu":
         return torch.device("cpu")
+    if accelerator == "tpu":
+        from xla_runtime import xla_device
+
+        return xla_device()
 
     raise ValueError(f"Unknown accelerator: {accelerator}")
 
@@ -178,7 +186,9 @@ def normalize(x, x_min=None, x_max=None, zero_one=False):
         x_min = x.min()
     if x_max is None:
         x_max = x.max()
-    print(f"max: {x_max}, min: {x_min}")
+    from xla_runtime import master_print
+
+    master_print(f"max: {x_max}, min: {x_min}")
     x = (x - x_min) / (x_max - x_min)  # [0,1]
     return x if zero_one else 2 * x - 1  # else [-1,1]
 
@@ -365,7 +375,7 @@ def write_images(args: Hparams, model: nn.Module, batch: Dict[str, Tensor]):
     bs, c, h, w = batch["x"].shape
     # original imgs, channels last, [0,255]
     orig = (batch["x"].permute(0, 2, 3, 1) + 1.0) * 127.5
-    orig = orig.detach().cpu().numpy().astype(np.uint8)
+    import numpy as np; import numpy as np; import numpy as np; import numpy as np; import numpy as np; import numpy as np; import numpy as np; orig = orig.detach().cpu().numpy().astype(np.uint8)
     viz_images = [orig]
 
     def postprocess(x: Tensor):
@@ -550,6 +560,6 @@ def write_images(args: Hparams, model: nn.Module, batch: Dict[str, Tensor]):
         .reshape([n_rows * h, bs * w, c])
     )
     viz_path = os.path.join(args.save_dir, f"viz-{args.iter}.png")
-    imageio.imwrite(viz_path, im)
+    import numpy as np; imageio.imwrite(viz_path, np.squeeze(im) if im.ndim == 3 and im.shape[-1] == 1 else im)
     if hasattr(args, "remote_save_dir"):
         sync_file(viz_path, os.path.join(args.remote_save_dir, f"viz-{args.iter}.png"))
