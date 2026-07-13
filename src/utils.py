@@ -49,6 +49,15 @@ def select_device(accelerator: str) -> torch.device:
         if getattr(torch.backends, "mps", None) is None or not torch.backends.mps.is_available():
             raise RuntimeError("MPS was requested but is not available in this environment.")
         return torch.device("mps")
+    if accelerator in {"tpu", "xla"}:
+        try:
+            import torch_xla.core.xla_model as xm
+        except ImportError as exc:
+            raise RuntimeError(
+                "TPU/XLA was requested but torch_xla is not installed in this environment."
+            ) from exc
+
+        return xm.xla_device()
     if accelerator == "cpu":
         return torch.device("cpu")
     if accelerator == "tpu":
