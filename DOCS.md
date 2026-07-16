@@ -44,6 +44,45 @@ autocast by default, and restricts artifact writes to the master process. Batch
 size is per replica. Use `tpu_launcher.py` directly for `benchmark.py`,
 `pgm/train_pgm.py`, or `pgm/train_cf.py`.
 
+### Counterfactual Launcher
+
+`src/pgm/run.sh` is the convenience wrapper for `src/pgm/train_cf.py`. It is
+dataset-aware, so Morpho-MNIST works out of the box while UKBB, CMNIST, and
+MIMIC can still be run by overriding the dataset-specific paths.
+
+Morpho-MNIST example:
+
+```bash
+cd src/pgm
+bash run.sh \
+  --dataset morphomnist \
+  --accelerator cpu \
+  --exp_name cf_morphomnist_cpu
+```
+
+UKBB example:
+
+```bash
+cd src/pgm
+bash run.sh \
+  --dataset ukbb \
+  --accelerator cuda \
+  --exp_name cf_ukbb_cuda \
+  --data_dir /path/to/ukbb \
+  --ckpt_dir /path/to/checkpoints \
+  --pgm_path /path/to/sup_pgm/checkpoint.pt \
+  --predictor_path /path/to/sup_aux_prob/checkpoint.pt \
+  --vae_path /path/to/ukbb_checkpoint.pt
+```
+
+For CMNIST or MIMIC, use `--dataset cmnist` or `--dataset mimic` and override
+the dataset paths and checkpoints as needed. The script preserves the same
+`--accelerator {cpu,mps,cuda,gpu,auto}` behavior as the other launchers.
+
+When you split the command across multiple lines, make sure each `\` is the
+last character on the line. Any trailing spaces after a backslash will break
+the shell continuation and the wrapper will fall back to its defaults.
+
 ## Compact Architecture
 
 ```mermaid

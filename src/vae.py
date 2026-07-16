@@ -513,7 +513,15 @@ class HVAE(nn.Module):
                 cf_zs.append(r_loc + r_scale * u)
             return cf_zs
         else:
-            return q_stats  # zs
+            # Only the sampled latent tensors are needed downstream.
+            # When cond_prior=True the decoder stores extra bookkeeping in a dict.
+            zs = []
+            for z in q_stats:
+                if isinstance(z, dict):
+                    zs.append(z["z"] if torch.is_tensor(z["z"]) else z["z"]["z"])
+                else:
+                    zs.append(z)
+            return zs  # zs
 
     def forward_latents(
         self, latents: List[Tensor], parents: Tensor, t: Optional[float] = None
