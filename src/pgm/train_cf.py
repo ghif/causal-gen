@@ -52,13 +52,126 @@ def loginfo(title: str, logger: Any, stats: Dict[str, Any]):
     logger.info(f"{title} | " + " - ".join(f"{k}: {v:.4f}" for k, v in stats.items()))
 
 
+def infer_dataset(hparams: Any, fallback: str = "ukbb") -> str:
+    """Infer the dataset family from checkpoint metadata or an explicit field."""
+    candidates = []
+    if hasattr(hparams, "dataset") and getattr(hparams, "dataset"):
+        candidates.append(str(getattr(hparams, "dataset")).lower())
+
+    hps = getattr(hparams, "hps", "")
+    if isinstance(hps, str):
+        candidates.append(hps.lower())
+
+    for candidate in candidates:
+        if "morphomnist" in candidate:
+            return "morphomnist"
+        if "cmnist" in candidate:
+            return "cmnist"
+        if "mimic" in candidate:
+            return "mimic"
+        if "ukbb" in candidate:
+            return "ukbb"
+    return fallback
+
+
+def build_pgm(args: Hparams) -> nn.Module:
+    """Instantiate the dataset-specific PGM used by the saved checkpoint."""
+    dataset = infer_dataset(args, fallback=str(getattr(args, "dataset", "ukbb")))
+    args.dataset = dataset
+    if "ukbb" in dataset:
+        from flow_pgm import FlowPGM as PGMClass
+    elif dataset == "morphomnist":
+        from flow_pgm import MorphoMNISTPGM as PGMClass
+    elif dataset == "cmnist":
+        from flow_pgm import ColourMNISTPGM as PGMClass
+    elif "mimic" in dataset:
+        from flow_pgm import ChestPGM as PGMClass
+    else:
+        raise NotImplementedError(f"Unsupported dataset: {dataset}")
+    return PGMClass(args)
+
+
+def ensure_setup(args: Hparams, default_setup: str) -> None:
+    """Backfill missing setup metadata for older checkpoints."""
+    if not hasattr(args, "setup") or not getattr(args, "setup"):
+        args.setup = default_setup
+
+
+def ensure_dataset_defaults(args: Hparams) -> None:
+    """Fill dataset-specific fields that some older checkpoints omit."""
+    dataset = infer_dataset(args, fallback=str(getattr(args, "dataset", "ukbb")))
+    args.dataset = dataset
+    if not hasattr(args, "hps") or not getattr(args, "hps"):
+        args.hps = dataset
+
+    if "ukbb" in dataset:
+        args.input_channels = getattr(args, "input_channels", 1)
+        args.parents_x = getattr(
+            args,
+            "parents_x",
+            ["mri_seq", "brain_volume", "ventricle_volume", "sex"],
+        )
+        args.concat_pa = getattr(args, "concat_pa", False)
+        args.context_norm = getattr(args, "context_norm", "log_standard")
+    elif dataset == "morphomnist":
+        args.input_channels = getattr(args, "input_channels", 1)
+        args.input_res = getattr(args, "input_res", 32)
+        args.pad = getattr(args, "pad", 4)
+        args.parents_x = getattr(
+            args, "parents_x", ["thickness", "intensity", "digit"]
+        )
+        args.concat_pa = getattr(args, "concat_pa", False)
+        args.context_norm = getattr(args, "context_norm", "[-1,1]")
+    elif dataset == "cmnist":
+        args.input_channels = getattr(args, "input_channels", 3)
+        args.input_res = getattr(args, "input_res", 32)
+        args.pad = getattr(args, "pad", 4)
+        args.parents_x = getattr(args, "parents_x", ["digit", "colour"])
+        args.concat_pa = getattr(args, "concat_pa", False)
+    elif "mimic" in dataset:
+        args.input_channels = getattr(args, "input_channels", 1)
+        args.input_res = getattr(args, "input_res", 192)
+        args.pad = getattr(args, "pad", 9)
+        args.parents_x = getattr(
+            args, "parents_x", ["age", "race", "sex", "finding"]
+        )
+        args.concat_pa = getattr(args, "concat_pa", False)
+
+
+def ensure_vae_defaults(args: Hparams) -> None:
+    """Backfill VAE constructor fields that older checkpoints may omit."""
+    args.bottleneck = getattr(args, "bottleneck", 4)
+    args.z_max_res = getattr(args, "z_max_res", getattr(args, "input_res", 32))
+    args.bias_max_res = getattr(
+        args, "bias_max_res", getattr(args, "input_res", 32)
+    )
+    args.x_like = getattr(args, "x_like", "diag_dgauss")
+    args.std_init = getattr(args, "std_init", 0.0)
+    args.cond_prior = getattr(args, "cond_prior", False)
+    args.q_correction = getattr(args, "q_correction", False)
+
+
+def ensure_loader_defaults(args: Hparams) -> None:
+    """Backfill dataloader-related fields from the training parser defaults."""
+    if hasattr(args, "device") and getattr(args.device, "type", None) not in {"cuda", "xla"}:
+        args.num_workers = 0
+    else:
+        args.num_workers = getattr(args, "num_workers", -1)
+    args.pin_memory = getattr(args, "pin_memory", "auto")
+    args.persistent_workers = getattr(args, "persistent_workers", "auto")
+    args.prefetch_factor = getattr(args, "prefetch_factor", -1)
+    args.sup_frac = getattr(args, "sup_frac", 1.0)
+
+
 def inv_preprocess(pa: Dict[str, Tensor]) -> Dict[str, Tensor]:
     # undo [-1,1] parent preprocessing back to original range
     for k, v in pa.items():
-        if k != "mri_seq" and k != "sex":
-            pa[k] = (v + 1) / 2  # [-1,1] -> [0,1]
-            _max, _min = get_attr_max_min(k)
-            pa[k] = pa[k] * (_max - _min) + _min
+        max_min = get_attr_max_min(k)
+        if max_min is None:
+            continue
+        pa[k] = (v + 1) / 2  # [-1,1] -> [0,1]
+        _max, _min = max_min
+        pa[k] = pa[k] * (_max - _min) + _min
     return pa
 
 
@@ -260,11 +373,18 @@ if __name__ == "__main__":
         help="Training accelerator.",
         type=str,
         default="auto",
-        choices=["auto", "cpu", "cuda", "mps", "tpu"],
+        choices=["auto", "cpu", "cuda", "gpu", "mps", "tpu"],
     )
     parser.add_argument("--exp_name", help="experiment name.", type=str, default="")
     parser.add_argument(
         "--data_dir", help="data directory to load form.", type=str, default=""
+    )
+    parser.add_argument(
+        "--dataset",
+        help="dataset family for counterfactual training.",
+        type=str,
+        default="auto",
+        choices=["auto", "ukbb", "morphomnist", "cmnist", "mimic"],
     )
     parser.add_argument(
         "--ckpt_dir",
@@ -328,7 +448,14 @@ if __name__ == "__main__":
         "--cf_particles", help="num counterfactual samples.", type=int, default=1
     )
     args = parser.parse_known_args()[0]
+    if args.accelerator == "gpu":
+        args.accelerator = "cuda"
+    if args.accelerator == "mps":
+        os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+    if args.do_pa in {"None", "none", "null", ""}:
+        args.do_pa = None
     args.device = select_device(args.accelerator)
+    explicit_dataset = args.dataset
 
     # update hparams if loading checkpoint
     if args.load_path:
@@ -341,11 +468,13 @@ if __name__ == "__main__":
                 for k, v in ckpt["hparams"].items()
                 if k not in {"load_path", "accelerator", "device"}
             }
-            if args.data_dir is not None:
+            if args.data_dir != "":
                 ckpt_args["data_dir"] = args.data_dir
             if args.testing:
                 ckpt_args["testing"] = args.testing
             vars(args).update(ckpt_args)
+            if explicit_dataset != "auto":
+                args.dataset = explicit_dataset
         else:
             print(f"Checkpoint not found at: {args.load_path}")
 
@@ -358,14 +487,14 @@ if __name__ == "__main__":
     predictor_args = Hparams()
     predictor_args.update(predictor_checkpoint["hparams"])
     predictor_args.device = args.device
-    predictor = FlowPGM(predictor_args).to(args.device)
+    predictor_args.dataset = (
+        args.dataset if args.dataset != "auto" else infer_dataset(predictor_args)
+    )
+    ensure_dataset_defaults(predictor_args)
+    ensure_loader_defaults(predictor_args)
+    ensure_setup(predictor_args, "sup_aux")
+    predictor = build_pgm(predictor_args).to(args.device)
     predictor.load_state_dict(predictor_checkpoint["ema_model_state_dict"])
-
-    # for backwards compatibility
-    if not hasattr(predictor_args, "dataset"):
-        predictor_args.dataset = "ukbb"
-    if hasattr(predictor_args, "loss_norm"):
-        args.loss_norm
 
     from train_pgm import setup_dataloaders
 
@@ -393,12 +522,14 @@ if __name__ == "__main__":
     pgm_args = Hparams()
     pgm_args.update(pgm_checkpoint["hparams"])
     pgm_args.device = args.device
-    pgm = FlowPGM(pgm_args).to(args.device)
+    pgm_args.dataset = (
+        args.dataset if args.dataset != "auto" else infer_dataset(pgm_args)
+    )
+    ensure_dataset_defaults(pgm_args)
+    ensure_loader_defaults(pgm_args)
+    ensure_setup(pgm_args, "sup_pgm")
+    pgm = build_pgm(pgm_args).to(args.device)
     pgm.load_state_dict(pgm_checkpoint["ema_model_state_dict"])
-
-    # for backwards compatibility
-    if not hasattr(pgm_args, "dataset"):
-        pgm_args.dataset = "ukbb"
     if args.data_dir != "":
         pgm_args.data_dir = args.data_dir
     dataloaders = setup_dataloaders(pgm_args)
@@ -416,8 +547,18 @@ if __name__ == "__main__":
     vae_args.update(vae_checkpoint["hparams"])
     if not hasattr(vae_args, "cond_prior"):  # for backwards compatibility
         vae_args.cond_prior = False
-    vae_args.kl_free_bits = vae_args.free_bits
+    vae_free_bits = getattr(vae_args, "free_bits", None)
+    if vae_free_bits is None:
+        vae_free_bits = getattr(vae_args, "kl_free_bits", 0.0)
+    vae_args.free_bits = vae_free_bits
+    vae_args.kl_free_bits = vae_free_bits
     vae_args.device = args.device
+    vae_args.dataset = (
+        args.dataset if args.dataset != "auto" else infer_dataset(vae_args)
+    )
+    ensure_dataset_defaults(vae_args)
+    ensure_loader_defaults(vae_args)
+    ensure_setup(vae_args, "sup_pgm")
     vae = HVAE(vae_args).to(args.device)
     vae.load_state_dict(vae_checkpoint["ema_model_state_dict"])
 
@@ -435,11 +576,19 @@ if __name__ == "__main__":
         for i, batch in loader:
             # preprocessing
             batch["x"] = (batch["x"].float().to(args.device) - 127.5) / 127.5  # [-1, 1]
-            batch["pa"] = (
-                batch["pa"][..., None, None]
-                .repeat(1, 1, args.input_res, args.input_res)
-                .float()
-                .to(args.device)
+            if "pa" not in batch:
+                batch["pa"] = (
+                    torch.cat(
+                        [
+                            batch[k] if len(batch[k].shape) > 1 else batch[k][..., None]
+                            for k in args.parents_x
+                        ],
+                        dim=1,
+                    )
+                )
+            batch["pa"] = batch["pa"].float().to(args.device)
+            batch["pa"] = batch["pa"][..., None, None].repeat(
+                1, 1, args.input_res, args.input_res
             )
             # forward pass
             out = vae(batch["x"], batch["pa"], beta=args.beta)
@@ -467,10 +616,13 @@ if __name__ == "__main__":
     args.elbo_constraint = 1.841216802597046  # train set elbo constraint
     args.wd = vae_args.wd
     args.betas = vae_args.betas
+    args.dataset = (
+        args.dataset
+        if args.dataset != "auto"
+        else infer_dataset(vae_args, infer_dataset(pgm_args, infer_dataset(predictor_args)))
+    )
 
     # init model
-    if not hasattr(vae_args, "dataset"):
-        args.dataset = "ukbb"
     model = DSCM(args, pgm, predictor, vae)
     ema = EMA(model, beta=args.ema_rate)
     model.to(args.device)
@@ -611,8 +763,11 @@ if __name__ == "__main__":
                     sync_tree(args.save_dir, args.remote_save_dir)
     else:
         # test model
-        model.load_state_dict(ckpt["model_state_dict"])
-        ema.ema_model.load_state_dict(ckpt["ema_model_state_dict"])
+        if args.load_path and path_exists(args.load_path):
+            with open_file(args.load_path, "rb") as f:
+                ckpt = torch.load(f, map_location="cpu")
+            model.load_state_dict(ckpt["model_state_dict"])
+            ema.ema_model.load_state_dict(ckpt["ema_model_state_dict"])
         stats, metrics = cf_epoch(
             args, model, ema, dataloaders, elbo_fn, None, split="test"
         )
