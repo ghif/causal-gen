@@ -23,3 +23,7 @@ torch==2.9.0
 torchvision==0.24.0
 torch_xla[tpu]==2.9.0
 tqdm==4.65.0
+gradio==4.44.1
+fastapi>=0.112.0,<0.113.0
+huggingface-hub>=0.19.3,<1.0
+pydantic>=2.0,<2.10
