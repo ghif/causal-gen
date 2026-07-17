@@ -52,6 +52,15 @@ def loginfo(title: str, logger: Any, stats: Dict[str, Any]):
     logger.info(f"{title} | " + " - ".join(f"{k}: {v:.4f}" for k, v in stats.items()))
 
 
+def log_run_summary(logger: Any, args: Hparams, keys: List[str]) -> None:
+    """Log a compact configuration summary instead of every argparse field."""
+    parts = []
+    for key in keys:
+        if hasattr(args, key):
+            parts.append(f"{key}={getattr(args, key)}")
+    logger.info("run | " + ", ".join(parts))
+
+
 def infer_dataset(hparams: Any, fallback: str = "ukbb") -> str:
     """Infer the dataset family from checkpoint metadata or an explicit field."""
     candidates = []
@@ -279,7 +288,11 @@ def cf_epoch(
         train_set = copy.deepcopy(dataloaders["train"].dataset.samples)
 
     loader = tqdm(
-        enumerate(dataloaders[split]), total=len(dataloaders[split]), mininterval=0.1
+        enumerate(dataloaders[split]),
+        total=len(dataloaders[split]),
+        mininterval=0.1,
+        leave=False,
+        desc=f"{split}",
     )
 
     for i, batch in loader:
@@ -323,7 +336,6 @@ def cf_epoch(
                 ema.update()
             else:
                 steps_skipped += 1
-                print(f"Steps skipped: {steps_skipped} - grad_norm: {grad_norm:.3f}")
         else:  # evaluation
             with torch.no_grad():
                 preds_cf = ema.ema_model.predictor.predict(**out["cfs"])
@@ -337,13 +349,16 @@ def cf_epoch(
         if i % args.plot_freq == 0:
             if is_train:
                 copy_do_pa = copy.deepcopy(args.do_pa)
-                for pa_k in dag_vars + [None]:
+                for pa_k in tqdm(
+                    dag_vars + [None],
+                    desc=f"{split} interventions",
+                    leave=False,
+                    mininterval=0.1,
+                ):
                     args.do_pa = pa_k
                     valid_stats, valid_metrics = cf_epoch(  # recursion
                         args, model, ema, dataloaders, elbo_fn, None, split="valid"
                     )
-                    loginfo(f"valid do({pa_k})", logger, valid_stats)
-                    loginfo(f"valid do({pa_k})", logger, valid_metrics)
                 args.do_pa = copy_do_pa
             # save_path = os.path.join(args.save_dir, f'{args.step}_{split}_{do_k}_cfs.pdf')
             # save_plot(save_path, batch, out['cfs'], do, out['var_cf_x'], num_images=args.imgs_plot)
@@ -355,13 +370,18 @@ def cf_epoch(
         stats["nll"] += out["nll"] * bs
         stats["kl"] += out["kl"] * bs
         stats = update_stats(stats, elbo_fn)  # aux_model stats
-        loader.set_description(
-            f"[{split}] lmbda: {model.lmbda.data.item():.3f}, "
-            + f", ".join(
-                f'{k}: {v / stats["n"]:.3f}' for k, v in stats.items() if k != "n"
+        if i == 0 or (i + 1) == len(dataloaders[split]) or (
+            (i + 1) % max(1, len(dataloaders[split]) // 10) == 0
+        ):
+            loader.set_description(
+                f"[{split}] lmbda: {model.lmbda.data.item():.3f}, "
+                + f", ".join(
+                    f'{k}: {v / stats["n"]:.3f}'
+                    for k, v in stats.items()
+                    if k != "n"
+                )
+                + (f", grad_norm: {grad_norm:.3f}" if is_train else "")
             )
-            + (f", grad_norm: {grad_norm:.3f}" if is_train else "")
-        )
     stats = {k: v / stats["n"] for k, v in stats.items() if k != "n"}
     return stats if is_train else (stats, get_metrics(args.dataset, preds, targets))
 
@@ -460,7 +480,7 @@ if __name__ == "__main__":
     # update hparams if loading checkpoint
     if args.load_path:
         if path_exists(args.load_path):
-            print(f"\nLoading checkpoint: {args.load_path}")
+            logging.getLogger(__name__).info("Loading checkpoint: %s", args.load_path)
             with open_file(args.load_path, "rb") as f:
                 ckpt = torch.load(f, map_location="cpu")
             ckpt_args = {
@@ -476,12 +496,16 @@ if __name__ == "__main__":
             if explicit_dataset != "auto":
                 args.dataset = explicit_dataset
         else:
-            print(f"Checkpoint not found at: {args.load_path}")
+            logging.getLogger(__name__).warning(
+                "Checkpoint not found at: %s", args.load_path
+            )
 
     seed_all(args.seed, args.deterministic)
 
     # Load predictors
-    print(f"\nLoading predictor checkpoint: {args.predictor_path}")
+    logging.getLogger(__name__).info(
+        "Loading predictor checkpoint: %s", args.predictor_path
+    )
     with open_file(args.predictor_path, "rb") as f:
         predictor_checkpoint = torch.load(f, map_location="cpu")
     predictor_args = Hparams()
@@ -513,10 +537,10 @@ if __name__ == "__main__":
         is_train=False,
     )
     stats = eval_epoch(predictor_args, predictor, dataloaders["test"])
-    print("test | " + " - ".join(f"{k}: {v:.4f}" for k, v in stats.items()))
+    loginfo("test", logging.getLogger(__name__), stats)
 
     # Load PGM
-    print(f"\nLoading PGM checkpoint: {args.pgm_path}")
+    logging.getLogger(__name__).info("Loading PGM checkpoint: %s", args.pgm_path)
     with open_file(args.pgm_path, "rb") as f:
         pgm_checkpoint = torch.load(f, map_location="cpu")
     pgm_args = Hparams()
@@ -540,7 +564,7 @@ if __name__ == "__main__":
     )
 
     # Load deep VAE
-    print(f"\nLoading VAE checkpoint: {args.vae_path}")
+    logging.getLogger(__name__).info("Loading VAE checkpoint: %s", args.vae_path)
     with open_file(args.vae_path, "rb") as f:
         vae_checkpoint = torch.load(f, map_location="cpu")
     vae_args = Hparams()
@@ -571,7 +595,13 @@ if __name__ == "__main__":
     def vae_epoch(args, vae, dataloader):
         vae.eval()
         stats = {k: 0 for k in ["elbo", "nll", "kl", "n"]}
-        loader = tqdm(enumerate(dataloader), total=len(dataloader))
+        loader = tqdm(
+            enumerate(dataloader),
+            total=len(dataloader),
+            leave=False,
+            mininterval=0.1,
+            desc="vae-eval",
+        )
 
         for i, batch in loader:
             # preprocessing
@@ -598,11 +628,14 @@ if __name__ == "__main__":
             stats["elbo"] += out["elbo"] * bs
             stats["nll"] += out["nll"] * bs
             stats["kl"] += out["kl"] * bs
-            loader.set_description(
-                f' => eval | nelbo: {stats["elbo"] / stats["n"]:.4f}'
-                + f' - nll: {stats["nll"] / stats["n"]:.4f}'
-                + f' - kl: {stats["kl"] / stats["n"]:.4f}'
-            )
+            if i == 0 or (i + 1) == len(dataloader) or (
+                (i + 1) % max(1, len(dataloader) // 10) == 0
+            ):
+                loader.set_description(
+                    f' => eval | nelbo: {stats["elbo"] / stats["n"]:.4f}'
+                    + f' - nll: {stats["nll"] / stats["n"]:.4f}'
+                    + f' - kl: {stats["kl"] / stats["n"]:.4f}'
+                )
         return {k: v / stats["n"] for k, v in stats.items() if k != "n"}
 
     stats = vae_epoch(vae_args, vae, dataloaders["test"])
@@ -687,16 +720,42 @@ if __name__ == "__main__":
                 move_optimizer_state_to_device(optimizer, args.device)
                 move_optimizer_state_to_device(lagrange_opt, args.device)
             else:
-                print("Checkpoint not found: {}".format(args.load_path))
+                logger.warning("Checkpoint not found: %s", args.load_path)
         else:
             args.start_epoch, args.step = 0, 0
             args.best_loss = float("inf")
 
-        for k in sorted(vars(args)):
-            logger.info(f"--{k}={vars(args)[k]}")
+        log_run_summary(
+            logger,
+            args,
+            [
+                "exp_name",
+                "accelerator",
+                "dataset",
+                "bs",
+                "epochs",
+                "lr",
+                "lr_lagrange",
+                "ema_rate",
+                "alpha",
+                "do_pa",
+                "eval_freq",
+                "plot_freq",
+                "cf_particles",
+                "load_path",
+                "pgm_path",
+                "predictor_path",
+                "vae_path",
+            ],
+        )
 
         # training loop
-        for epoch in range(args.start_epoch, args.epochs):
+        for epoch in tqdm(
+            range(args.start_epoch, args.epochs),
+            desc="epochs",
+            leave=True,
+            mininterval=0.5,
+        ):
             for dataloader in dataloaders.values():
                 if hasattr(dataloader.sampler, "set_epoch"):
                     dataloader.sampler.set_epoch(epoch)
@@ -771,5 +830,5 @@ if __name__ == "__main__":
         stats, metrics = cf_epoch(
             args, model, ema, dataloaders, elbo_fn, None, split="test"
         )
-        print(f"\n[test] " + " - ".join(f"{k}: {v:.4f}" for k, v in stats.items()))
-        print(f"[test] " + " - ".join(f"{k}: {v:.4f}" for k, v in metrics.items()))
+        loginfo("test", logging.getLogger(__name__), stats)
+        loginfo("test metrics", logging.getLogger(__name__), metrics)
