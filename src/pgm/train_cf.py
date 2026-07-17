@@ -52,6 +52,10 @@ def loginfo(title: str, logger: Any, stats: Dict[str, Any]):
     logger.info(f"{title} | " + " - ".join(f"{k}: {v:.4f}" for k, v in stats.items()))
 
 
+def is_quiet(args: Any) -> bool:
+    return bool(getattr(args, "quiet", False))
+
+
 def log_run_summary(logger: Any, args: Hparams, keys: List[str]) -> None:
     """Log a compact configuration summary instead of every argparse field."""
     parts = []
@@ -273,6 +277,7 @@ def cf_epoch(
 ):
     "counterfactual auxiliary training/eval epoch"
     is_train = split == "train"
+    quiet = is_quiet(args)
     model.vae.train(is_train)
     model.pgm.eval()
     model.predictor.eval()
@@ -293,6 +298,7 @@ def cf_epoch(
         mininterval=0.1,
         leave=False,
         desc=f"{split}",
+        disable=quiet,
     )
 
     for i, batch in loader:
@@ -349,12 +355,15 @@ def cf_epoch(
         if i % args.plot_freq == 0:
             if is_train:
                 copy_do_pa = copy.deepcopy(args.do_pa)
-                for pa_k in tqdm(
-                    dag_vars + [None],
-                    desc=f"{split} interventions",
-                    leave=False,
-                    mininterval=0.1,
-                ):
+                intervention_iter = dag_vars + [None]
+                if not quiet:
+                    intervention_iter = tqdm(
+                        intervention_iter,
+                        desc=f"{split} interventions",
+                        leave=False,
+                        mininterval=0.1,
+                    )
+                for pa_k in intervention_iter:
                     args.do_pa = pa_k
                     valid_stats, valid_metrics = cf_epoch(  # recursion
                         args, model, ema, dataloaders, elbo_fn, None, split="valid"
@@ -370,8 +379,10 @@ def cf_epoch(
         stats["nll"] += out["nll"] * bs
         stats["kl"] += out["kl"] * bs
         stats = update_stats(stats, elbo_fn)  # aux_model stats
-        if i == 0 or (i + 1) == len(dataloaders[split]) or (
-            (i + 1) % max(1, len(dataloaders[split]) // 10) == 0
+        if not quiet and (
+            i == 0
+            or (i + 1) == len(dataloaders[split])
+            or ((i + 1) % max(1, len(dataloaders[split]) // 10) == 0)
         ):
             loader.set_description(
                 f"[{split}] lmbda: {model.lmbda.data.item():.3f}, "
@@ -466,6 +477,12 @@ if __name__ == "__main__":
     parser.add_argument("--imgs_plot", help="num images to plot.", type=int, default=10)
     parser.add_argument(
         "--cf_particles", help="num counterfactual samples.", type=int, default=1
+    )
+    parser.add_argument(
+        "--quiet",
+        help="reduce terminal and notebook logging noise.",
+        action="store_true",
+        default=False,
     )
     args = parser.parse_known_args()[0]
     if args.accelerator == "gpu":
@@ -755,16 +772,19 @@ if __name__ == "__main__":
             desc="epochs",
             leave=True,
             mininterval=0.5,
+            disable=args.quiet,
         ):
             for dataloader in dataloaders.values():
                 if hasattr(dataloader.sampler, "set_epoch"):
                     dataloader.sampler.set_epoch(epoch)
             args.epoch = epoch + 1
-            logger.info(f"Epoch: {args.epoch}")
+            if not args.quiet:
+                logger.info(f"Epoch: {args.epoch}")
             stats = cf_epoch(
                 args, model, ema, dataloaders, elbo_fn, optimizers, split="train"
             )
-            loginfo("train", logger, stats)
+            if not args.quiet:
+                loginfo("train", logger, stats)
 
             if epoch % args.eval_freq == 0:
                 # evaluate single parent interventions
@@ -774,9 +794,14 @@ if __name__ == "__main__":
                     valid_stats, metrics = cf_epoch(
                         args, model, ema, dataloaders, elbo_fn, None, split="valid"
                     )
-                    loginfo(f"valid do({pa_k})", logger, valid_stats)
-                    loginfo(f"valid do({pa_k})", logger, metrics)
+                    if not args.quiet:
+                        loginfo(f"valid do({pa_k})", logger, valid_stats)
+                        loginfo(f"valid do({pa_k})", logger, metrics)
                 args.do_pa = copy_do_pa
+
+                if args.quiet:
+                    loginfo("valid", logger, valid_stats)
+                    loginfo("valid metrics", logger, metrics)
 
                 for k, v in stats.items():
                     writer.add_scalar("train/" + k, v, args.step)
@@ -816,7 +841,8 @@ if __name__ == "__main__":
                         ckpt_path,
                         os.path.join(args.remote_save_dir, f"{args.step}_checkpoint.pt"),
                     )
-                    logger.info(f"Model saved: {ckpt_path}")
+                    if not args.quiet:
+                        logger.info(f"Model saved: {ckpt_path}")
                 if master and hasattr(args, "remote_save_dir"):
                     writer.flush()
                     sync_tree(args.save_dir, args.remote_save_dir)
@@ -830,5 +856,6 @@ if __name__ == "__main__":
         stats, metrics = cf_epoch(
             args, model, ema, dataloaders, elbo_fn, None, split="test"
         )
-        loginfo("test", logging.getLogger(__name__), stats)
-        loginfo("test metrics", logging.getLogger(__name__), metrics)
+        if not args.quiet:
+            loginfo("test", logging.getLogger(__name__), stats)
+            loginfo("test metrics", logging.getLogger(__name__), metrics)
