@@ -15,6 +15,7 @@ The app exposes two workflows:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import functools
 import glob
 import os
@@ -474,14 +475,34 @@ def predict_image_parents(
     return predictor_to_parents(predictions, device)
 
 
+@contextlib.contextmanager
+def isolated_style_rng(style_seed: int, device: torch.device):
+    device = torch.device(device)
+    cuda_devices = []
+    if device.type == "cuda":
+        cuda_devices = [device.index if device.index is not None else torch.cuda.current_device()]
+
+    with torch.random.fork_rng(devices=cuda_devices):
+        torch.manual_seed(int(style_seed))
+        yield
+
+
 @torch.no_grad()
 def generate_from_sliders(
-    args: Hparams, model: torch.nn.Module, digit: int, thickness: float, intensity: float
+    args: Hparams,
+    model: torch.nn.Module,
+    digit: int,
+    thickness: float,
+    intensity: float,
+    style_seed: int = 0,
 ) -> Tuple[Image.Image, Dict[str, float]]:
     parents = build_parent_dict(digit, thickness, intensity, args.device)
     context = vae_preprocess(args, parents, args.device)
-    x, _ = model.vae.sample(parents=context, return_loc=True)
-    return tensor_to_pil(x), summarize_parents(parents)
+    with isolated_style_rng(style_seed, args.device):
+        x, _ = model.vae.sample(parents=context, return_loc=True)
+    summary = summarize_parents(parents)
+    summary["style_seed"] = int(style_seed)
+    return tensor_to_pil(x), summary
 
 
 @torch.no_grad()
@@ -524,11 +545,14 @@ def update_linked_preview(
     seed_image: Image.Image | None,
     digit: int,
     thickness: float,
+    style_seed: int = 0,
 ) -> Tuple[float, Image.Image, Dict[str, float]]:
     intensity = linked_intensity_from_thickness(
         args, model, thickness, seed_image=seed_image
     )
-    image, factors = generate_from_sliders(args, model, digit, thickness, intensity)
+    image, factors = generate_from_sliders(
+        args, model, digit, thickness, intensity, style_seed
+    )
     return intensity, image, factors
 
 
@@ -625,6 +649,13 @@ def build_app(args: Hparams, model: torch.nn.Module) -> gr.Blocks:
                     step=0.5,
                     label="Intensity",
                 )
+                style_seed = gr.Slider(
+                    minimum=0,
+                    maximum=999999,
+                    value=0,
+                    step=1,
+                    label="Style seed",
+                )
                 seed_image = gr.Image(
                     type="pil",
                     label="Seed image for counterfactual editing",
@@ -650,8 +681,10 @@ def build_app(args: Hparams, model: torch.nn.Module) -> gr.Blocks:
                 slider_json = gr.JSON(label="Generated slider factors")
 
         generate_btn.click(
-            fn=lambda d, t, i: generate_from_sliders(args, model, int(d), t, i),
-            inputs=[digit, thickness, intensity],
+            fn=lambda d, t, i, s: generate_from_sliders(
+                args, model, int(d), t, i, int(s)
+            ),
+            inputs=[digit, thickness, intensity, style_seed],
             outputs=[generated, slider_json],
             api_name=False,
             show_progress="hidden",
@@ -661,10 +694,10 @@ def build_app(args: Hparams, model: torch.nn.Module) -> gr.Blocks:
         )
 
         thickness.release(
-            fn=lambda img, d, t: update_linked_preview(
-                args, model, img, int(d), t
+            fn=lambda img, d, t, s: update_linked_preview(
+                args, model, img, int(d), t, int(s)
             ),
-            inputs=[seed_image, digit, thickness],
+            inputs=[seed_image, digit, thickness, style_seed],
             outputs=[intensity, generated, slider_json],
             api_name=False,
             show_progress="hidden",
@@ -674,8 +707,10 @@ def build_app(args: Hparams, model: torch.nn.Module) -> gr.Blocks:
         )
 
         intensity.release(
-            fn=lambda d, t, i: generate_from_sliders(args, model, int(d), t, i),
-            inputs=[digit, thickness, intensity],
+            fn=lambda d, t, i, s: generate_from_sliders(
+                args, model, int(d), t, i, int(s)
+            ),
+            inputs=[digit, thickness, intensity, style_seed],
             outputs=[generated, slider_json],
             api_name=False,
             show_progress="hidden",
@@ -685,8 +720,23 @@ def build_app(args: Hparams, model: torch.nn.Module) -> gr.Blocks:
         )
 
         digit.change(
-            fn=lambda d, t, i: generate_from_sliders(args, model, int(d), t, i),
-            inputs=[digit, thickness, intensity],
+            fn=lambda d, t, i, s: generate_from_sliders(
+                args, model, int(d), t, i, int(s)
+            ),
+            inputs=[digit, thickness, intensity, style_seed],
+            outputs=[generated, slider_json],
+            api_name=False,
+            show_progress="hidden",
+            trigger_mode="always_last",
+            concurrency_limit=1,
+            concurrency_id="slider-preview",
+        )
+
+        style_seed.release(
+            fn=lambda d, t, i, s: generate_from_sliders(
+                args, model, int(d), t, i, int(s)
+            ),
+            inputs=[digit, thickness, intensity, style_seed],
             outputs=[generated, slider_json],
             api_name=False,
             show_progress="hidden",
@@ -712,10 +762,10 @@ def build_app(args: Hparams, model: torch.nn.Module) -> gr.Blocks:
         )
 
         demo.load(
-            fn=lambda img, d, t: update_linked_preview(
-                args, model, img, int(d), t
+            fn=lambda img, d, t, s: update_linked_preview(
+                args, model, img, int(d), t, int(s)
             ),
-            inputs=[seed_image, digit, thickness],
+            inputs=[seed_image, digit, thickness, style_seed],
             outputs=[intensity, generated, slider_json],
             api_name=False,
             show_progress="hidden",
